@@ -143,6 +143,11 @@ To use your own data, organize it according to the [Dataset Structure](#dataset-
 - **`images/`** contains the extracted video frames named as `cam{XX}_{YYYY}.png`, where `XX` is the zero-padded camera index and `YYYY` is the zero-padded frame index.
 - **`sparse/0/`** contains valid COLMAP-format camera parameters and point cloud files. You may obtain these via COLMAP, MASt3R, or any other SfM pipeline. Refer to the generation notes above for guidance on which views to use.
 
+For calibrated multi-sensor Depthkit/Scatter captures, see the
+[`preprocessing/depthkit`](preprocessing/depthkit/) converter. It undistorts the
+RGB streams, converts the fixed rig calibration to COLMAP convention, and can
+initialize `points3D.txt` from synchronized depth frames.
+
 <details>
 <summary><b>Variable Reference</b></summary>
 
