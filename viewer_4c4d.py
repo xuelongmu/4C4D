@@ -1162,6 +1162,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             client.camera.fov = focal_length_to_shot_fov_y(
                 focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
             )
+            refresh_keyframe_gui()
 
         @field_of_view.on_update
         def _(_: Any) -> None:
@@ -1217,6 +1218,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             client.camera.fov = focal_length_to_shot_fov_y(
                 current_focal, preset[0], preset[1], current_aspect()
             )
+            refresh_keyframe_gui()
 
         @toggle_playback.on_trigger
         def _(_: Any) -> None:
