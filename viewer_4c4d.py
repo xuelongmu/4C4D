@@ -683,7 +683,7 @@ def load_model(config_path: Path, checkpoint_path: Path) -> tuple[Any, Any, int,
     return model, pipe, int(iteration), time_duration
 
 
-def frame_to_timestamp(frame: int, num_frames: int, time_duration: tuple[float, float]) -> float:
+def frame_to_timestamp(frame: float, num_frames: int, time_duration: tuple[float, float]) -> float:
     start, end = time_duration
     return start + (end - start) * float(frame) / float(num_frames)
 
@@ -1212,7 +1212,12 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             )
 
         def request_render(_: Any = None) -> None:
-            timestamp_text.value = f"{frame_to_timestamp(int(frame_slider.value), args.frames, time_duration):.4f}"
+            rendered_frame = (
+                state.dynamic_frame_override
+                if state.dynamic_frame_override is not None
+                else float(frame_slider.value)
+            )
+            timestamp_text.value = f"{frame_to_timestamp(rendered_frame, args.frames, time_duration):.4f}"
             with state.lock:
                 state.snapshot = capture_snapshot()
             state.dirty.set()
@@ -1771,6 +1776,7 @@ def self_test() -> None:
     np.testing.assert_allclose(opengl_c2w_to_opencv_c2w(wxyz, position), c2w_cv, atol=1e-7)
     assert frame_to_timestamp(0, 300, (0.0, 10.0)) == 0.0
     assert math.isclose(frame_to_timestamp(299, 300, (0.0, 10.0)), 299.0 / 30.0)
+    assert math.isclose(frame_to_timestamp(1.25, 300, (0.0, 10.0)), 1.25 / 30.0)
     assert math.isclose(
         full_frame_equivalent_to_focal_length(50.0, 24.89, 18.66, 16.0 / 9.0),
         34.5694444444,
