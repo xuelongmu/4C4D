@@ -266,6 +266,15 @@ def scheduled_shot_frame(
     return min(unwrapped_frame, duration_frames - 1), unwrapped_frame >= duration_frames
 
 
+def shot_playback_needs_rebase(
+    is_playing: bool,
+    live_frame: int,
+    last_scheduled_frame: int,
+) -> bool:
+    """Detect a playhead change that did not come from the playback worker."""
+    return bool(is_playing) and int(live_frame) != int(last_scheduled_frame)
+
+
 def export_keyframes(
     keyframes: list[ShotKeyframe],
     duration_frames: int,
@@ -1843,14 +1852,20 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 if bool(preview_shot.value):
                     now = time.monotonic()
                     playback_fps = max(int(final_fps.value), 1)
+                    live_frame = int(shot_frame.value)
                     if (
                         not state.shot_playing
                         or shot_started_at is None
                         or playback_fps != shot_schedule_fps
+                        or shot_playback_needs_rebase(
+                            state.shot_playing,
+                            live_frame,
+                            last_scheduled_frame,
+                        )
                     ):
                         state.shot_playing = True
                         shot_started_at = now
-                        shot_started_frame = int(shot_frame.value)
+                        shot_started_frame = live_frame
                         shot_schedule_fps = playback_fps
                         last_scheduled_frame = shot_started_frame
                     next_frame, finished = scheduled_shot_frame(
@@ -1971,6 +1986,9 @@ def self_test() -> None:
     assert scheduled_shot_frame(0, 0.5, 24, 48, False) == (12, False)
     assert scheduled_shot_frame(47, 1.0 / 24.0, 24, 48, False) == (47, True)
     assert scheduled_shot_frame(47, 1.0 / 24.0, 24, 48, True) == (0, False)
+    assert not shot_playback_needs_rebase(False, 12, 8)
+    assert not shot_playback_needs_rebase(True, 12, 12)
+    assert shot_playback_needs_rebase(True, 18, 12)
     euler = np.array([12.0, -24.0, 5.0])
     euler_round_trip = rotation_matrix_to_euler_xyz_degrees(
         quaternion_wxyz_to_matrix(euler_xyz_degrees_to_quaternion(euler))
