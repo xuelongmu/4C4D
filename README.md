@@ -201,8 +201,43 @@ python viewer_4c4d.py \
 Open `http://localhost:8080` on the same machine. This also works when the
 server runs in WSL2 and the browser runs on Windows. Use `--width` to trade
 interactive resolution for frame rate. Space toggles playback. The bundled
-viewer controls provide persistent look sensitivity, independent X/Y orbit
-inversion, and vertical RMB-move inversion settings.
+viewer controls provide persistent look and move sensitivity plus independent
+X/Y orbit and move inversion settings.
+
+The **Cinematic Shot** panel turns the free camera into a shot camera. Set the
+shot cursor, navigate or enter an exact XYZ/Euler pose, choose the lens, then
+select **Add / update keyframe**. Scrubbing or enabling **Preview camera move**
+evaluates the interpolated camera path while the dynamic splat advances with
+the same elapsed timeline time.
+The viewport can show the 3D path, key-camera frustums, rule-of-thirds guides,
+an action-safe frame, and common cinematic aspect ratios.
+The docked cinematic sequencer provides a frame ruler, draggable playhead,
+transport and key-navigation controls, plus camera-transform and lens/FOV key
+tracks. Dynamic scene time is shown as a readout, not a keyframable track. Its
+light/dark theme toggle is persistent.
+Realtime preview resolution matches the browser viewport by default. The
+selected shot aspect is shown with a configurable translucent matte over any
+visible overscan; wider gates are letterboxed without
+stretching. The translucent matte preserves scene context on every side of the
+gate. Final output height is derived from the shot aspect, and that
+aspect is embedded in JSON, glTF, and USD camera exports.
+
+The **Camera & Lens** panel keeps filmback width, filmback height, and focal
+length on one compact row, with vertical and horizontal FOV paired beneath it;
+editing any value keeps the lens fields synchronized.
+Sensor-gate presets include Super 35 4-perf, Super 35 3-perf, full frame,
+APS-C, Micro Four Thirds, and a custom gate. A full-frame-equivalent focal
+length is editable for lens matching; changing either physical focal length or
+35mm equivalent updates the other value and both FOV readouts.
+
+The **Render & Export** panel renders the current shot through the native CUDA
+rasterizer and downloads an H.264 MP4. It can also download the animated camera
+as glTF 2.0, USD ASCII, or a lossless 4C4D JSON sidecar containing shot-frame
+camera position, WXYZ rotation, and focal length.
+MP4 rendering keeps dynamic playback at its native timing relative to the
+shot/output FPS. MP4 export requires `ffmpeg` on `PATH` (for Ubuntu/WSL:
+`sudo apt install ffmpeg`). Use `--shot-frames` to change the default shot
+length.
 
 ### 5. Evaluation
 
