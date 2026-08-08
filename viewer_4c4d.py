@@ -433,7 +433,7 @@ def shot_to_gltf_bytes(
             {"bufferView": 3, "componentType": 5126, "count": len(ordered), "type": "SCALAR"},
         ],
         "extensionsUsed": ["KHR_animation_pointer"],
-        "animations": [{"name": name, "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}, {"input": 0, "output": 2, "interpolation": "LINEAR"}, {"input": 0, "output": 3, "interpolation": "LINEAR"}], "channels": [{"sampler": 0, "target": {"node": 1, "path": "translation"}}, {"sampler": 1, "target": {"node": 1, "path": "rotation"}}, {"sampler": 2, "target": {"extensions": {"KHR_animation_pointer": {"pointer": "/cameras/0/perspective/yfov"}}}}]}],
+        "animations": [{"name": name, "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}, {"input": 0, "output": 2, "interpolation": "LINEAR"}, {"input": 0, "output": 3, "interpolation": "LINEAR"}], "channels": [{"sampler": 0, "target": {"node": 1, "path": "translation"}}, {"sampler": 1, "target": {"node": 1, "path": "rotation"}}, {"sampler": 2, "target": {"path": "pointer", "extensions": {"KHR_animation_pointer": {"pointer": "/cameras/0/perspective/yfov"}}}}]}],
         "extras": {
             "fps": fps,
             "shot_aspect_ratio": shot_aspect,
@@ -2008,6 +2008,7 @@ def self_test() -> None:
     assert math.isclose(gltf["cameras"][0]["perspective"]["aspectRatio"], 16.0 / 9.0)
     assert gltf["nodes"][0]["children"] == [1]
     assert gltf["animations"][0]["channels"][0]["target"]["node"] == 1
+    assert gltf["animations"][0]["channels"][2]["target"]["path"] == "pointer"
     assert (
         gltf["animations"][0]["channels"][2]["target"]["extensions"]["KHR_animation_pointer"]["pointer"]
         == "/cameras/0/perspective/yfov"
