@@ -28,6 +28,7 @@ import numpy as np
 OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0])
 MIN_FOCAL_LENGTH_MM = 1.0
 MAX_FOCAL_LENGTH_MM = 500.0
+MAX_RENDER_EDGE = 4096
 
 
 def quaternion_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
@@ -201,6 +202,26 @@ def scene_frame_for_shot(
     native_scene_fps = float(num_scene_frames) / duration_seconds
     scene_frame = float(shot_frame) / max(float(shot_fps), 1.0) * native_scene_fps
     return float(np.clip(scene_frame, 0.0, max(num_scene_frames - 1, 0)))
+
+
+def render_resolution_for_long_edge(
+    long_edge: int,
+    aspect: float,
+    max_edge: int = MAX_RENDER_EDGE,
+) -> tuple[int, int]:
+    """Return an even render size with a bounded landscape or portrait long edge."""
+    edge = int(np.clip(int(long_edge), 2, max(int(max_edge), 2)))
+    edge -= edge % 2
+    aspect = max(float(aspect), 1e-6)
+    if aspect >= 1.0:
+        width = edge
+        height = max(2, int(round(width / aspect)))
+    else:
+        height = edge
+        width = max(2, int(round(height * aspect)))
+    width -= width % 2
+    height -= height % 2
+    return width, height
 
 
 def focal_length_to_fov_y(focal_length_mm: float, sensor_height_mm: float) -> float:
@@ -771,7 +792,7 @@ def render_shot_mp4(
     keyframes: list[ShotKeyframe],
     duration_frames: int,
     fps: int,
-    width: int,
+    long_edge: int,
     aspect: float,
     interpolation: str,
     num_scene_frames: int,
@@ -784,9 +805,7 @@ def render_shot_mp4(
     render_lock: Any,
 ) -> None:
     """Render an interpolated camera move and stream RGB frames into ffmpeg."""
-    width -= width % 2
-    height = max(64, int(round(width / max(aspect, 1e-6))))
-    height -= height % 2
+    width, height = render_resolution_for_long_edge(long_edge, aspect)
     command = [
         "ffmpeg",
         "-loglevel",
@@ -1052,7 +1071,13 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             export_format = client.gui.add_dropdown("Camera export", ("glTF 2.0", "USD ASCII", "4C4D JSON"), initial_value="glTF 2.0")
             export_camera = client.gui.add_button("Download camera data")
         with client.gui.add_folder("Render & Export", expand_by_default=False):
-            final_width = client.gui.add_number("Output width", initial_value=1920, min=320, max=4096, step=2)
+            final_long_edge = client.gui.add_number(
+                "Output long edge",
+                initial_value=1920,
+                min=320,
+                max=MAX_RENDER_EDGE,
+                step=2,
+            )
             final_resolution = client.gui.add_text("Output resolution", initial_value="1920 × 1080 · 16:9", disabled=True)
             final_fps = client.gui.add_number("Output FPS", initial_value=24, min=1, max=120, step=1)
             final_crf = client.gui.add_slider("H.264 quality (CRF)", min=10, max=35, step=1, initial_value=18)
@@ -1075,10 +1100,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             )
 
         def update_output_resolution() -> None:
-            width = max(2, int(final_width.value))
-            width -= width % 2
-            height = max(2, int(round(width / current_aspect())))
-            height -= height % 2
+            width, height = render_resolution_for_long_edge(
+                int(final_long_edge.value), current_aspect()
+            )
             final_resolution.value = f"{width} × {height} · {aspect_preset.value}"
 
         def shot_length() -> int:
@@ -1657,7 +1681,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             update_output_resolution()
             request_render()
 
-        final_width.on_update(lambda _: update_output_resolution())
+        final_long_edge.on_update(lambda _: update_output_resolution())
 
         def camera_export(
             selected_format: str | None = None,
@@ -1749,7 +1773,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             render_settings = {
                 "duration": shot_length(),
                 "fps": int(final_fps.value),
-                "width": int(final_width.value),
+                "long_edge": int(final_long_edge.value),
                 "aspect": current_aspect(),
                 "interpolation": str(shot_interpolation.value),
                 "crf": int(final_crf.value),
@@ -1779,7 +1803,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                             keyframes=copied_keys,
                             duration_frames=int(render_settings["duration"]),
                             fps=int(render_settings["fps"]),
-                            width=int(render_settings["width"]),
+                            long_edge=int(render_settings["long_edge"]),
                             aspect=float(render_settings["aspect"]),
                             interpolation=str(render_settings["interpolation"]),
                             num_scene_frames=args.frames,
@@ -1796,7 +1820,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                         if output_size > max_download_size:
                             raise RuntimeError(
                                 f"MP4 is {output_size / (1024 * 1024):.1f} MiB; "
-                                "the browser download limit is 256 MiB. Lower output width or raise CRF."
+                                "the browser download limit is 256 MiB. Lower the output long edge or raise CRF."
                             )
                         client.send_file_download(output_path.name, output_path.read_bytes(), save_immediately=True)
                         if str(render_settings["sidecar"]) != "None":
@@ -1965,6 +1989,9 @@ def self_test() -> None:
     assert frame_to_timestamp(0, 300, (0.0, 10.0)) == 0.0
     assert math.isclose(frame_to_timestamp(299, 300, (0.0, 10.0)), 299.0 / 30.0)
     assert math.isclose(frame_to_timestamp(1.25, 300, (0.0, 10.0)), 1.25 / 30.0)
+    assert render_resolution_for_long_edge(4096, 16.0 / 9.0) == (4096, 2304)
+    assert render_resolution_for_long_edge(4096, 9.0 / 16.0) == (2304, 4096)
+    assert render_resolution_for_long_edge(8192, 9.0 / 16.0) == (2304, 4096)
     assert math.isclose(
         full_frame_equivalent_to_focal_length(50.0, 24.89, 18.66, 16.0 / 9.0),
         34.5694444444,
