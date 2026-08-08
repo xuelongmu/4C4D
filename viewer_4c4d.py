@@ -1181,6 +1181,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         @client.camera.on_update
         def _(_: Any) -> None:
             if not gui_guard:
+                state.dynamic_frame_override = None
                 sync_camera_gui()
             request_render()
 
@@ -1394,7 +1395,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         @final_fps.on_update
         def _(_: Any) -> None:
-            apply_shot_frame(float(shot_frame.value))
+            if state.dynamic_frame_override is not None:
+                apply_shot_frame(float(shot_frame.value))
 
         @aspect_preset.on_update
         def _(_: Any) -> None:
