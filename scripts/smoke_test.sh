@@ -16,8 +16,10 @@ STAMP=$(date +%H%M%S)
 OUT_DIR="${RUN_NAME}-${STAMP}"
 LOG="/tmp/smoke_${RUN_NAME}_${STAMP}.log"
 
+PY=${FOURC4D_PYTHON:-/home/zerospace/micromamba/envs/4c4d/bin/python}
+
 START=$(date +%s)
-CUDA_VISIBLE_DEVICES="$GPU" micromamba run -n 4c4d python -u train.py \
+CUDA_VISIBLE_DEVICES="$GPU" "$PY" -u train.py \
   --config configs/custom/xuelong_posefix_smoke700.yaml \
   --output_dir "$OUT_DIR" \
   --res 4 \
