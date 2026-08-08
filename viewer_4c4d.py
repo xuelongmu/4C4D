@@ -234,6 +234,21 @@ def preview_fov_y_for_gate(shot_fov_y: float, viewport_aspect: float, shot_aspec
     return 2.0 * math.atan(math.tan(float(shot_fov_y) * 0.5) * shot_aspect / viewport_aspect)
 
 
+def preview_projection_matches_scene(
+    shot_fov_y: float,
+    viewport_aspect: float,
+    shot_aspect: float,
+    preview_framing: bool,
+) -> bool:
+    """Return whether Viser overlays share the framed background projection."""
+    return not preview_framing or math.isclose(
+        preview_fov_y_for_gate(shot_fov_y, viewport_aspect, shot_aspect),
+        float(shot_fov_y),
+        rel_tol=1e-7,
+        abs_tol=1e-7,
+    )
+
+
 def export_keyframes(
     keyframes: list[ShotKeyframe],
     duration_frames: int,
@@ -893,6 +908,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         shot_duration_default = min(max(args.shot_frames, 2), 600)
         keyframes: list[ShotKeyframe] = []
         path_handles: list[Any] = []
+        last_path_projection_matches: bool | None = None
         gui_guard = False
         last_shot_aspect = initial_shot_aspect
         last_sensor_dimensions = (sensor_width_default, sensor_height_default)
@@ -1157,11 +1173,32 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 separators=(",", ":"),
             )
 
+        def camera_path_projection_matches() -> bool:
+            canvas_width = max(int(client.camera.image_width), 1)
+            canvas_height = max(int(client.camera.image_height), 1)
+            canvas_aspect = (
+                float(client.camera.aspect)
+                if float(client.camera.aspect) > 0
+                else canvas_width / canvas_height
+            )
+            return preview_projection_matches_scene(
+                float(client.camera.fov),
+                canvas_aspect,
+                current_aspect(),
+                bool(match_preview_aspect.value),
+            )
+
         def refresh_camera_path() -> None:
+            nonlocal last_path_projection_matches
             for handle in path_handles:
                 handle.remove()
             path_handles.clear()
-            if not bool(show_camera_path.value) or not keyframes:
+            last_path_projection_matches = camera_path_projection_matches()
+            if (
+                not bool(show_camera_path.value)
+                or not keyframes
+                or not last_path_projection_matches
+            ):
                 return
             ordered = sorted(keyframes, key=lambda item: item.shot_frame)
             if len(ordered) > 1:
@@ -1259,6 +1296,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 lock_camera_to_shot.value = False
             if not gui_guard:
                 sync_camera_gui()
+            if camera_path_projection_matches() != last_path_projection_matches:
+                refresh_camera_path()
             request_render()
 
         @frame_slider.on_update
@@ -1267,7 +1306,10 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 state.dynamic_frame_override = None
             request_render()
         render_width.on_update(request_render)
-        match_preview_aspect.on_update(request_render)
+        @match_preview_aspect.on_update
+        def _(_: Any) -> None:
+            refresh_camera_path()
+            request_render()
         matte_opacity.on_update(request_render)
         rule_of_thirds.on_update(request_render)
         action_safe.on_update(request_render)
@@ -1877,6 +1919,9 @@ def self_test() -> None:
         )
     assert math.isclose(preview_fov_y_for_gate(test_shot_fov, 2.0, 16.0 / 9.0), test_shot_fov)
     assert preview_fov_y_for_gate(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0) > test_shot_fov
+    assert preview_projection_matches_scene(test_shot_fov, 2.0, 16.0 / 9.0, True)
+    assert not preview_projection_matches_scene(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0, True)
+    assert preview_projection_matches_scene(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0, False)
     euler = np.array([12.0, -24.0, 5.0])
     euler_round_trip = rotation_matrix_to_euler_xyz_degrees(
         quaternion_wxyz_to_matrix(euler_xyz_degrees_to_quaternion(euler))
