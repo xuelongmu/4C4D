@@ -1289,6 +1289,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 )
                 commit_manual_camera_edit()
             refresh_keyframe_gui()
+            if sensor_changed:
+                refresh_camera_path()
 
         @field_of_view.on_update
         def _(_: Any) -> None:
@@ -1361,6 +1363,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 )
                 commit_manual_camera_edit()
             refresh_keyframe_gui()
+            refresh_camera_path()
 
         @toggle_playback.on_trigger
         def _(_: Any) -> None:
