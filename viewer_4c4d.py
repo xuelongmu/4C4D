@@ -262,12 +262,30 @@ def export_keyframes(
     return ordered
 
 
-def focal_length_to_full_frame_equivalent(focal_length_mm: float, sensor_width_mm: float) -> float:
-    return float(focal_length_mm) * 36.0 / max(float(sensor_width_mm), 1e-6)
+def focal_length_to_full_frame_equivalent(
+    focal_length_mm: float,
+    sensor_width_mm: float,
+    sensor_height_mm: float,
+    shot_aspect: float,
+) -> float:
+    sensor_gate_width, _ = shot_gate_dimensions(
+        sensor_width_mm, sensor_height_mm, shot_aspect
+    )
+    full_frame_gate_width, _ = shot_gate_dimensions(36.0, 24.0, shot_aspect)
+    return float(focal_length_mm) * full_frame_gate_width / sensor_gate_width
 
 
-def full_frame_equivalent_to_focal_length(equivalent_mm: float, sensor_width_mm: float) -> float:
-    return float(equivalent_mm) * max(float(sensor_width_mm), 1e-6) / 36.0
+def full_frame_equivalent_to_focal_length(
+    equivalent_mm: float,
+    sensor_width_mm: float,
+    sensor_height_mm: float,
+    shot_aspect: float,
+) -> float:
+    sensor_gate_width, _ = shot_gate_dimensions(
+        sensor_width_mm, sensor_height_mm, shot_aspect
+    )
+    full_frame_gate_width, _ = shot_gate_dimensions(36.0, 24.0, shot_aspect)
+    return float(equivalent_mm) * sensor_gate_width / full_frame_gate_width
 
 
 def rotation_matrix_to_euler_xyz_degrees(matrix: np.ndarray) -> np.ndarray:
@@ -926,12 +944,23 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 )
                 equivalent_focal = client.gui.add_number(
                     "35mm equivalent (mm)",
-                    initial_value=focal_length_to_full_frame_equivalent(initial_focal, sensor_width_default),
+                    initial_value=focal_length_to_full_frame_equivalent(
+                        initial_focal,
+                        sensor_width_default,
+                        sensor_height_default,
+                        initial_shot_aspect,
+                    ),
                     min=focal_length_to_full_frame_equivalent(
-                        MIN_FOCAL_LENGTH_MM, sensor_width_default
+                        MIN_FOCAL_LENGTH_MM,
+                        sensor_width_default,
+                        sensor_height_default,
+                        initial_shot_aspect,
                     ),
                     max=focal_length_to_full_frame_equivalent(
-                        MAX_FOCAL_LENGTH_MM, sensor_width_default
+                        MAX_FOCAL_LENGTH_MM,
+                        sensor_width_default,
+                        sensor_height_default,
+                        initial_shot_aspect,
                     ),
                     step=0.1,
                     hint="Editable full-frame-equivalent focal length",
@@ -1045,10 +1074,16 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 field_of_view.min = tuple(float(value) for value in minimum_fov)
                 field_of_view.max = tuple(float(value) for value in maximum_fov)
                 equivalent_focal.min = focal_length_to_full_frame_equivalent(
-                    MIN_FOCAL_LENGTH_MM, sensor_width_mm
+                    MIN_FOCAL_LENGTH_MM,
+                    sensor_width_mm,
+                    sensor_height_mm,
+                    current_aspect(),
                 )
                 equivalent_focal.max = focal_length_to_full_frame_equivalent(
-                    MAX_FOCAL_LENGTH_MM, sensor_width_mm
+                    MAX_FOCAL_LENGTH_MM,
+                    sensor_width_mm,
+                    sensor_height_mm,
+                    current_aspect(),
                 )
                 bounded_fov_y = float(
                     np.clip(
@@ -1069,7 +1104,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                         2.0 * math.atan(math.tan(bounded_fov_y * 0.5) * current_aspect())
                     ),
                 )
-                equivalent_focal.value = focal_length_to_full_frame_equivalent(focal_mm, sensor_width_mm)
+                equivalent_focal.value = focal_length_to_full_frame_equivalent(
+                    focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
+                )
                 update_coordinate_text()
             finally:
                 gui_guard = False
@@ -1267,7 +1304,12 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             sensor_width_mm, sensor_height_mm, _ = lens_values()
             focal_mm = float(
                 np.clip(
-                    full_frame_equivalent_to_focal_length(float(equivalent_focal.value), sensor_width_mm),
+                    full_frame_equivalent_to_focal_length(
+                        float(equivalent_focal.value),
+                        sensor_width_mm,
+                        sensor_height_mm,
+                        current_aspect(),
+                    ),
                     MIN_FOCAL_LENGTH_MM,
                     MAX_FOCAL_LENGTH_MM,
                 )
@@ -1694,8 +1736,26 @@ def self_test() -> None:
     np.testing.assert_allclose(opengl_c2w_to_opencv_c2w(wxyz, position), c2w_cv, atol=1e-7)
     assert frame_to_timestamp(0, 300, (0.0, 10.0)) == 0.0
     assert math.isclose(frame_to_timestamp(299, 300, (0.0, 10.0)), 299.0 / 30.0)
-    assert math.isclose(full_frame_equivalent_to_focal_length(50.0, 24.89), 34.5694444444)
-    assert math.isclose(focal_length_to_full_frame_equivalent(34.5694444444, 24.89), 50.0)
+    assert math.isclose(
+        full_frame_equivalent_to_focal_length(50.0, 24.89, 18.66, 16.0 / 9.0),
+        34.5694444444,
+    )
+    assert math.isclose(
+        focal_length_to_full_frame_equivalent(
+            34.5694444444, 24.89, 18.66, 16.0 / 9.0
+        ),
+        50.0,
+    )
+    portrait_equivalent = focal_length_to_full_frame_equivalent(
+        50.0, 24.89, 18.66, 9.0 / 16.0
+    )
+    assert math.isclose(portrait_equivalent, 50.0 * 13.5 / (18.66 * 9.0 / 16.0))
+    assert math.isclose(
+        full_frame_equivalent_to_focal_length(
+            portrait_equivalent, 24.89, 18.66, 9.0 / 16.0
+        ),
+        50.0,
+    )
     gate_width, gate_height = shot_gate_dimensions(24.89, 18.66, 16.0 / 9.0)
     assert math.isclose(gate_width, 24.89)
     assert math.isclose(gate_height, 24.89 / (16.0 / 9.0))
