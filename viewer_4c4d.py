@@ -720,6 +720,7 @@ def render_shot_mp4(
     output_path: Path,
     progress_callback: Any,
     cancelled: threading.Event,
+    render_lock: Any,
 ) -> None:
     """Render an interpolated camera move and stream RGB frames into ffmpeg."""
     width -= width % 2
@@ -770,7 +771,10 @@ def render_shot_mp4(
                 frame=scene_frame_for_shot(shot_frame, fps, num_scene_frames, time_duration),
                 render_width=width,
             )
-            image, _ = render_image(model, pipe, snapshot, num_scene_frames, time_duration, white_background)
+            with render_lock:
+                image, _ = render_image(
+                    model, pipe, snapshot, num_scene_frames, time_duration, white_background
+                )
             process.stdin.write(np.ascontiguousarray(image).tobytes())
             progress_callback((shot_frame + 1) / duration_frames, shot_frame + 1)
         process.stdin.close()
@@ -1636,24 +1640,24 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                             final_progress.value = progress * 100.0
                             final_status.value = f"Rendering {completed} / {render_settings['duration']} frames"
 
-                        with render_lock:
-                            render_shot_mp4(
-                                model=model,
-                                pipe=pipe,
-                                keyframes=copied_keys,
-                                duration_frames=int(render_settings["duration"]),
-                                fps=int(render_settings["fps"]),
-                                width=int(render_settings["width"]),
-                                aspect=float(render_settings["aspect"]),
-                                interpolation=str(render_settings["interpolation"]),
-                                num_scene_frames=args.frames,
-                                time_duration=time_duration,
-                                white_background=args.white_background,
-                                crf=int(render_settings["crf"]),
-                                output_path=output_path,
-                                progress_callback=update_progress,
-                                cancelled=state.render_cancel,
-                            )
+                        render_shot_mp4(
+                            model=model,
+                            pipe=pipe,
+                            keyframes=copied_keys,
+                            duration_frames=int(render_settings["duration"]),
+                            fps=int(render_settings["fps"]),
+                            width=int(render_settings["width"]),
+                            aspect=float(render_settings["aspect"]),
+                            interpolation=str(render_settings["interpolation"]),
+                            num_scene_frames=args.frames,
+                            time_duration=time_duration,
+                            white_background=args.white_background,
+                            crf=int(render_settings["crf"]),
+                            output_path=output_path,
+                            progress_callback=update_progress,
+                            cancelled=state.render_cancel,
+                            render_lock=render_lock,
+                        )
                         output_size = output_path.stat().st_size
                         max_download_size = 256 * 1024 * 1024
                         if output_size > max_download_size:
