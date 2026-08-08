@@ -112,3 +112,7 @@ Run the tests with:
 ```bash
 python -m unittest discover -s preprocessing/depthkit/tests -v
 ```
+
+The dated Xuelong calibration, RGB-only training, viewer, and camera-count
+ablation handoff is recorded in
+[`docs/experiments/2026-08-08-xuelong-depthkit-rgb.md`](../../docs/experiments/2026-08-08-xuelong-depthkit-rgb.md).

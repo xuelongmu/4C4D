@@ -560,6 +560,28 @@ class ReferenceCamera:
     def viser_pose(self) -> tuple[np.ndarray, np.ndarray]:
         return opencv_c2w_to_viser(self.c2w_cv)
 
+    def rotated_ccw(self, degrees: int) -> "ReferenceCamera":
+        """Return an equivalent camera for an image rotated CCW in 90-degree steps."""
+        quarter_turns = (degrees // 90) % 4
+        angle = math.radians(90 * quarter_turns)
+        camera_roll = np.array(
+            [
+                [math.cos(angle), -math.sin(angle), 0.0],
+                [math.sin(angle), math.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        c2w = self.c2w_cv.copy()
+        c2w[:3, :3] = c2w[:3, :3] @ camera_roll
+        if quarter_turns % 2:
+            width, height = self.height, self.width
+            fx, fy = self.fy, self.fx
+        else:
+            width, height = self.width, self.height
+            fx, fy = self.fx, self.fy
+        return ReferenceCamera(self.name, width, height, fx, fy, c2w)
+
 
 class RenderCamera:
     """Minimal camera interface consumed by gaussian_renderer.render()."""
@@ -855,7 +877,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             "4:3 · Academy": 4.0 / 3.0,
             "9:16 · Vertical": 9.0 / 16.0,
         }
-        initial_shot_aspect = aspect_options["16:9 · UHD"]
+        reference_aspect = initial_reference.width / initial_reference.height
+        initial_aspect_label = min(
+            aspect_options, key=lambda label: abs(math.log(aspect_options[label] / reference_aspect))
+        )
+        initial_shot_aspect = aspect_options[initial_aspect_label]
         sensor_presets: dict[str, tuple[float, float] | None] = {
             "Super 35 · 4-perf (24.89 × 18.66)": (24.89, 18.66),
             "Super 35 · 3-perf (24.89 × 14.00)": (24.89, 14.00),
@@ -973,7 +999,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             shot_interpolation = client.gui.add_dropdown("Interpolation", ("Smooth ease", "Linear"), initial_value="Smooth ease")
             preview_shot = client.gui.add_checkbox("Preview camera move", initial_value=False)
             loop_shot = client.gui.add_checkbox("Loop shot", initial_value=True)
-            aspect_preset = client.gui.add_dropdown("Shot framing", tuple(aspect_options), initial_value="16:9 · UHD")
+            aspect_preset = client.gui.add_dropdown(
+                "Shot framing", tuple(aspect_options), initial_value=initial_aspect_label
+            )
             match_preview_aspect = client.gui.add_checkbox("Preview shot gate", initial_value=True)
             matte_opacity = client.gui.add_slider("Outside matte", min=0, max=95, step=5, initial_value=50)
             rule_of_thirds = client.gui.add_checkbox("Rule of thirds", initial_value=False)
@@ -1755,6 +1783,14 @@ def self_test() -> None:
     c2w_cv[:3, 3] = [1.0, 2.0, 3.0]
     wxyz, position = opencv_c2w_to_viser(c2w_cv)
     np.testing.assert_allclose(opengl_c2w_to_opencv_c2w(wxyz, position), c2w_cv, atol=1e-7)
+    reference = ReferenceCamera("cam00", 2560, 1440, 1500.0, 1490.0, np.eye(4))
+    upright = reference.rotated_ccw(90)
+    assert (upright.width, upright.height, upright.fx, upright.fy) == (1440, 2560, 1490.0, 1500.0)
+    np.testing.assert_allclose(
+        upright.c2w_cv[:3, :3],
+        np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+        atol=1e-7,
+    )
     assert frame_to_timestamp(0, 300, (0.0, 10.0)) == 0.0
     assert math.isclose(frame_to_timestamp(299, 300, (0.0, 10.0)), 299.0 / 30.0)
     assert math.isclose(
@@ -1865,6 +1901,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cameras-json", type=Path, default=None)
     parser.add_argument("--training-views", default="1,10,13,20")
     parser.add_argument("--initial-camera", default="cam10")
+    parser.add_argument(
+        "--camera-rotation-ccw",
+        type=int,
+        choices=(0, 90, 180, 270),
+        default=0,
+        help="Display correction for source images stored with camera roll",
+    )
     parser.add_argument("--frames", type=int, default=300)
     parser.add_argument("--frame", type=int, default=150)
     parser.add_argument("--fps", type=int, default=30)
@@ -1891,6 +1934,11 @@ def main() -> None:
     args.cameras_json = args.cameras_json or args.checkpoint.parent / "cameras.json"
     training_views = [int(value) for value in args.training_views.split(",") if value.strip()]
     references = load_reference_cameras(args.cameras_json, training_views)
+    if args.camera_rotation_ccw:
+        references = {
+            name: reference.rotated_ccw(args.camera_rotation_ccw)
+            for name, reference in references.items()
+        }
     model, pipe, iteration, time_duration = load_model(args.config, args.checkpoint)
     run_server(args, model, pipe, iteration, time_duration, references)
 
