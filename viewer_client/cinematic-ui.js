@@ -256,6 +256,7 @@
       if (event.target.matches("input, textarea, select")) return;
       if (event.code === "Space") {
         event.preventDefault();
+        event.stopPropagation();
         controlForLabel("Play shot timeline", "checkbox")?.click();
       } else if (event.key.toLowerCase() === "k") {
         event.preventDefault();

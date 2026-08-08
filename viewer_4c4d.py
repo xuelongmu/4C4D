@@ -904,6 +904,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         gui_guard = False
         last_shot_aspect = initial_shot_aspect
         last_sensor_dimensions = (sensor_width_default, sensor_height_default)
+        last_camera_pose = (
+            np.asarray(client.camera.wxyz, dtype=np.float64).copy(),
+            np.asarray(client.camera.position, dtype=np.float64).copy(),
+            float(client.camera.fov),
+        )
 
         with client.gui.add_folder("4C4D Playback", expand_by_default=False):
             frame_slider = client.gui.add_slider("Frame", min=0, max=args.frames - 1, step=1, initial_value=args.frame)
@@ -1068,7 +1073,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             )
 
         def sync_camera_gui() -> None:
-            nonlocal gui_guard
+            nonlocal gui_guard, last_camera_pose
             gui_guard = True
             try:
                 camera_position.value = tuple(float(value) for value in client.camera.position)
@@ -1117,6 +1122,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
                 )
                 update_coordinate_text()
+                last_camera_pose = (
+                    np.asarray(client.camera.wxyz, dtype=np.float64).copy(),
+                    np.asarray(client.camera.position, dtype=np.float64).copy(),
+                    float(client.camera.fov),
+                )
             finally:
                 gui_guard = False
 
@@ -1237,8 +1247,15 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         @client.camera.on_update
         def _(_: Any) -> None:
-            if not gui_guard:
+            previous_wxyz, previous_position, previous_fov = last_camera_pose
+            pose_changed = (
+                not np.allclose(client.camera.wxyz, previous_wxyz, atol=1e-7, rtol=1e-7)
+                or not np.allclose(client.camera.position, previous_position, atol=1e-7, rtol=1e-7)
+                or not math.isclose(float(client.camera.fov), previous_fov, abs_tol=1e-7, rel_tol=1e-7)
+            )
+            if not gui_guard and pose_changed:
                 lock_camera_to_shot.value = False
+            if not gui_guard:
                 sync_camera_gui()
             request_render()
 
@@ -1375,7 +1392,20 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         @toggle_playback.on_trigger
         def _(_: Any) -> None:
-            play.value = not bool(play.value)
+            next_value = not bool(play.value)
+            if next_value:
+                preview_shot.value = False
+            play.value = next_value
+
+        @play.on_update
+        def _(_: Any) -> None:
+            if bool(play.value):
+                preview_shot.value = False
+
+        @preview_shot.on_update
+        def _(_: Any) -> None:
+            if bool(preview_shot.value):
+                play.value = False
 
         @lock_camera_to_shot.on_update
         def _(_: Any) -> None:
