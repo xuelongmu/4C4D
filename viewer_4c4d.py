@@ -12,6 +12,7 @@ import base64
 import gc
 import json
 import math
+import re
 import subprocess
 import tempfile
 import threading
@@ -188,6 +189,77 @@ def fov_y_to_focal_length(fov_y: float, sensor_height_mm: float) -> float:
     return max(sensor_height_mm, 1e-6) / (2.0 * math.tan(max(fov_y, 1e-6) * 0.5))
 
 
+def shot_gate_dimensions(sensor_width_mm: float, sensor_height_mm: float, shot_aspect: float) -> tuple[float, float]:
+    """Return the centered crop of a physical filmback used by the shot gate."""
+    sensor_width_mm = max(float(sensor_width_mm), 1e-6)
+    sensor_height_mm = max(float(sensor_height_mm), 1e-6)
+    shot_aspect = max(float(shot_aspect), 1e-6)
+    if shot_aspect >= sensor_width_mm / sensor_height_mm:
+        return sensor_width_mm, sensor_width_mm / shot_aspect
+    return sensor_height_mm * shot_aspect, sensor_height_mm
+
+
+def focal_length_to_shot_fov_y(
+    focal_length_mm: float,
+    sensor_width_mm: float,
+    sensor_height_mm: float,
+    shot_aspect: float,
+) -> float:
+    return focal_length_to_fov_y(
+        focal_length_mm,
+        shot_gate_dimensions(sensor_width_mm, sensor_height_mm, shot_aspect)[1],
+    )
+
+
+def shot_fov_y_to_focal_length(
+    fov_y: float,
+    sensor_width_mm: float,
+    sensor_height_mm: float,
+    shot_aspect: float,
+) -> float:
+    return fov_y_to_focal_length(
+        fov_y,
+        shot_gate_dimensions(sensor_width_mm, sensor_height_mm, shot_aspect)[1],
+    )
+
+
+def preview_fov_y_for_gate(shot_fov_y: float, viewport_aspect: float, shot_aspect: float) -> float:
+    """Expand vertical FOV when a wide shot gate is letterboxed in a narrow viewport."""
+    viewport_aspect = max(float(viewport_aspect), 1e-6)
+    shot_aspect = max(float(shot_aspect), 1e-6)
+    if viewport_aspect >= shot_aspect:
+        return float(shot_fov_y)
+    return 2.0 * math.atan(math.tan(float(shot_fov_y) * 0.5) * shot_aspect / viewport_aspect)
+
+
+def export_keyframes(
+    keyframes: list[ShotKeyframe],
+    duration_frames: int,
+    smooth: bool,
+) -> list[ShotKeyframe]:
+    """Bake smooth motion per frame and ensure every sidecar reaches the shot tail."""
+    duration_frames = max(int(duration_frames), 1)
+    if smooth:
+        baked: list[ShotKeyframe] = []
+        for frame in range(duration_frames):
+            key = interpolate_keyframes(keyframes, frame, smooth=True)
+            baked.append(ShotKeyframe(frame, key.wxyz.copy(), key.position.copy(), key.fov_y))
+        return baked
+    ordered = [
+        ShotKeyframe(key.shot_frame, key.wxyz.copy(), key.position.copy(), key.fov_y)
+        for key in sorted(keyframes, key=lambda item: item.shot_frame)
+        if key.shot_frame < duration_frames
+    ]
+    if not ordered or ordered[0].shot_frame > 0:
+        head = interpolate_keyframes(keyframes, 0, smooth=False)
+        ordered.insert(0, ShotKeyframe(0, head.wxyz.copy(), head.position.copy(), head.fov_y))
+    tail_frame = duration_frames - 1
+    if ordered[-1].shot_frame < tail_frame:
+        tail = interpolate_keyframes(keyframes, tail_frame, smooth=False)
+        ordered.append(ShotKeyframe(tail_frame, tail.wxyz.copy(), tail.position.copy(), tail.fov_y))
+    return ordered
+
+
 def focal_length_to_full_frame_equivalent(focal_length_mm: float, sensor_width_mm: float) -> float:
     return float(focal_length_mm) * 36.0 / max(float(sensor_width_mm), 1e-6)
 
@@ -234,6 +306,7 @@ def shot_to_json_bytes(
     sensor_width_mm: float,
     sensor_height_mm: float,
     shot_aspect: float,
+    duration_frames: int | None = None,
 ) -> bytes:
     payload = {
         "schema": "4c4d.camera-shot/1.0",
@@ -243,15 +316,18 @@ def shot_to_json_bytes(
         "sensor_width_mm": sensor_width_mm,
         "sensor_height_mm": sensor_height_mm,
         "shot_aspect_ratio": shot_aspect,
+        "duration_frames": duration_frames or max(key.shot_frame for key in keyframes) + 1,
         "keyframes": [
             {
                 "shot_frame": key.shot_frame,
                 "position": key.position.tolist(),
                 "rotation_wxyz": key.wxyz.tolist(),
                 "vertical_fov_degrees": math.degrees(key.fov_y),
-                "focal_length_mm": fov_y_to_focal_length(key.fov_y, sensor_height_mm),
+                "focal_length_mm": shot_fov_y_to_focal_length(
+                    key.fov_y, sensor_width_mm, sensor_height_mm, shot_aspect
+                ),
                 "horizontal_fov_degrees": math.degrees(
-                    focal_length_to_fov_y(fov_y_to_focal_length(key.fov_y, sensor_height_mm), sensor_width_mm)
+                    2.0 * math.atan(math.tan(key.fov_y * 0.5) * shot_aspect)
                 ),
             }
             for key in sorted(keyframes, key=lambda item: item.shot_frame)
@@ -267,16 +343,18 @@ def shot_to_gltf_bytes(
     sensor_width_mm: float,
     sensor_height_mm: float,
     shot_aspect: float,
+    duration_frames: int | None = None,
 ) -> bytes:
     """Create an embedded glTF 2.0 camera animation without optional dependencies."""
     ordered = sorted(keyframes, key=lambda key: key.shot_frame)
     times = np.asarray([key.shot_frame / fps for key in ordered], dtype="<f4")
     translations = np.asarray([key.position for key in ordered], dtype="<f4")
     rotations = np.asarray([[key.wxyz[1], key.wxyz[2], key.wxyz[3], key.wxyz[0]] for key in ordered], dtype="<f4")
+    vertical_fovs = np.asarray([key.fov_y for key in ordered], dtype="<f4")
     chunks: list[bytes] = []
     views: list[dict[str, int]] = []
     offset = 0
-    for array in (times, translations, rotations):
+    for array in (times, translations, rotations, vertical_fovs):
         raw = array.tobytes()
         padding = (-len(raw)) % 4
         chunks.append(raw + b"\0" * padding)
@@ -288,7 +366,10 @@ def shot_to_gltf_bytes(
         "asset": {"version": "2.0", "generator": "4C4D Cinematic Viewer"},
         "scene": 0,
         "scenes": [{"nodes": [0]}],
-        "nodes": [{"name": name, "camera": 0}],
+        "nodes": [
+            {"name": "4C4D_Z_up_to_glTF_Y_up", "rotation": [-math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)], "children": [1]},
+            {"name": name, "camera": 0},
+        ],
         "cameras": [{"name": name, "type": "perspective", "perspective": {"yfov": first.fov_y, "aspectRatio": shot_aspect, "znear": 0.01, "zfar": 100.0}}],
         "buffers": [{"byteLength": len(binary), "uri": "data:application/octet-stream;base64," + base64.b64encode(binary).decode("ascii")}],
         "bufferViews": views,
@@ -296,14 +377,20 @@ def shot_to_gltf_bytes(
             {"bufferView": 0, "componentType": 5126, "count": len(ordered), "type": "SCALAR", "min": [float(times.min())], "max": [float(times.max())]},
             {"bufferView": 1, "componentType": 5126, "count": len(ordered), "type": "VEC3"},
             {"bufferView": 2, "componentType": 5126, "count": len(ordered), "type": "VEC4"},
+            {"bufferView": 3, "componentType": 5126, "count": len(ordered), "type": "SCALAR"},
         ],
-        "animations": [{"name": name, "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}, {"input": 0, "output": 2, "interpolation": "LINEAR"}], "channels": [{"sampler": 0, "target": {"node": 0, "path": "translation"}}, {"sampler": 1, "target": {"node": 0, "path": "rotation"}}]}],
+        "extensionsUsed": ["KHR_animation_pointer"],
+        "animations": [{"name": name, "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}, {"input": 0, "output": 2, "interpolation": "LINEAR"}, {"input": 0, "output": 3, "interpolation": "LINEAR"}], "channels": [{"sampler": 0, "target": {"node": 1, "path": "translation"}}, {"sampler": 1, "target": {"node": 1, "path": "rotation"}}, {"sampler": 2, "target": {"extensions": {"KHR_animation_pointer": {"pointer": "/cameras/0/perspective/yfov"}}}}]}],
         "extras": {
             "fps": fps,
             "shot_aspect_ratio": shot_aspect,
             "sensor_width_mm": sensor_width_mm,
             "sensor_height_mm": sensor_height_mm,
-            "focal_length_mm": [fov_y_to_focal_length(key.fov_y, sensor_height_mm) for key in ordered],
+            "duration_frames": duration_frames or ordered[-1].shot_frame + 1,
+            "focal_length_mm": [
+                shot_fov_y_to_focal_length(key.fov_y, sensor_width_mm, sensor_height_mm, shot_aspect)
+                for key in ordered
+            ],
         },
     }
     return json.dumps(gltf, indent=2).encode("utf-8")
@@ -316,8 +403,12 @@ def shot_to_usda_bytes(
     sensor_width_mm: float,
     sensor_height_mm: float,
     shot_aspect: float,
+    duration_frames: int | None = None,
 ) -> bytes:
     ordered = sorted(keyframes, key=lambda key: key.shot_frame)
+    gate_width_mm, gate_height_mm = shot_gate_dimensions(
+        sensor_width_mm, sensor_height_mm, shot_aspect
+    )
     matrix_samples: list[str] = []
     focal_samples: list[str] = []
     for key in ordered:
@@ -326,15 +417,19 @@ def shot_to_usda_bytes(
         c2w[:3, 3] = key.position
         rows = ", ".join("(" + ", ".join(f"{value:.9g}" for value in row) + ")" for row in c2w.T)
         matrix_samples.append(f"            {key.shot_frame}: ({rows})")
-        focal_samples.append(f"            {key.shot_frame}: {fov_y_to_focal_length(key.fov_y, sensor_height_mm):.9g}")
-    safe_name = "".join(character if character.isalnum() else "_" for character in name) or "CameraShot"
+        focal_samples.append(
+            f"            {key.shot_frame}: {shot_fov_y_to_focal_length(key.fov_y, sensor_width_mm, sensor_height_mm, shot_aspect):.9g}"
+        )
+    safe_name = re.sub(r"[^A-Za-z0-9_]", "_", name) or "CameraShot"
+    if not re.match(r"[A-Za-z_]", safe_name[0]):
+        safe_name = "_" + safe_name
     matrix_sample_text = ",\n".join(matrix_samples)
     focal_sample_text = ",\n".join(focal_samples)
     text = f'''#usda 1.0
 (
     defaultPrim = "{safe_name}"
     startTimeCode = {ordered[0].shot_frame}
-    endTimeCode = {ordered[-1].shot_frame}
+    endTimeCode = {(duration_frames or ordered[-1].shot_frame + 1) - 1}
     timeCodesPerSecond = {fps}
     upAxis = "Z"
 )
@@ -348,8 +443,10 @@ def Camera "{safe_name}"
     float focalLength.timeSamples = {{
 {focal_sample_text}
     }}
-    float verticalAperture = {sensor_height_mm}
-    float horizontalAperture = {sensor_width_mm}
+    float verticalAperture = {gate_height_mm}
+    float horizontalAperture = {gate_width_mm}
+    custom double physicalSensorWidthMm = {sensor_width_mm}
+    custom double physicalSensorHeightMm = {sensor_height_mm}
     custom double shotAspectRatio = {shot_aspect}
 }}
 '''
@@ -596,8 +693,8 @@ def render_shot_mp4(
     cancelled: threading.Event,
 ) -> None:
     """Render an interpolated camera move and stream RGB frames into ffmpeg."""
-    height = max(64, int(round(width / max(aspect, 1e-6))))
     width -= width % 2
+    height = max(64, int(round(width / max(aspect, 1e-6))))
     height -= height % 2
     command = [
         "ffmpeg",
@@ -671,6 +768,7 @@ class ClientState:
         self.shot_playing = False
         self.final_rendering = False
         self.render_cancel = threading.Event()
+        self.dynamic_frame_override: float | None = None
 
 
 def create_viser_server(host: str, port: int) -> Any:
@@ -721,6 +819,14 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             client.camera.wxyz = initial_wxyz
             client.camera.position = initial_position
             client.camera.fov = initial_reference.fov_y
+        aspect_options = {
+            "16:9 · UHD": 16.0 / 9.0,
+            "2.39:1 · Scope": 2.39,
+            "1.85:1 · Flat": 1.85,
+            "4:3 · Academy": 4.0 / 3.0,
+            "9:16 · Vertical": 9.0 / 16.0,
+        }
+        initial_shot_aspect = aspect_options["16:9 · UHD"]
         sensor_presets: dict[str, tuple[float, float] | None] = {
             "Super 35 · 4-perf (24.89 × 18.66)": (24.89, 18.66),
             "Super 35 · 3-perf (24.89 × 14.00)": (24.89, 14.00),
@@ -732,9 +838,14 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         }
         sensor_preset_default = "Super 35 · 4-perf (24.89 × 18.66)"
         sensor_width_default, sensor_height_default = sensor_presets[sensor_preset_default]  # type: ignore[misc]
-        initial_focal = fov_y_to_focal_length(initial_reference.fov_y, sensor_height_default)
+        initial_focal = shot_fov_y_to_focal_length(
+            initial_reference.fov_y,
+            sensor_width_default,
+            sensor_height_default,
+            initial_shot_aspect,
+        )
         initial_horizontal_fov = math.degrees(
-            focal_length_to_fov_y(initial_focal, sensor_width_default)
+            2.0 * math.atan(math.tan(initial_reference.fov_y * 0.5) * initial_shot_aspect)
         )
         shot_duration_default = min(max(args.shot_frames, 2), 600)
         keyframes = [
@@ -748,13 +859,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         ]
         path_handles: list[Any] = []
         gui_guard = False
-        aspect_options = {
-            "16:9 · UHD": 16.0 / 9.0,
-            "2.39:1 · Scope": 2.39,
-            "1.85:1 · Flat": 1.85,
-            "4:3 · Academy": 4.0 / 3.0,
-            "9:16 · Vertical": 9.0 / 16.0,
-        }
+        last_shot_aspect = initial_shot_aspect
 
         with client.gui.add_folder("4C4D Playback", expand_by_default=False):
             frame_slider = client.gui.add_slider("Frame", min=0, max=args.frames - 1, step=1, initial_value=args.frame)
@@ -826,7 +931,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             export_format = client.gui.add_dropdown("Camera export", ("glTF 2.0", "USD ASCII", "4C4D JSON"), initial_value="glTF 2.0")
             export_camera = client.gui.add_button("Download camera data")
         with client.gui.add_folder("Render & Export", expand_by_default=False):
-            final_width = client.gui.add_number("Output width", initial_value=1920, min=320, max=7680, step=2)
+            final_width = client.gui.add_number("Output width", initial_value=1920, min=320, max=4096, step=2)
             final_resolution = client.gui.add_text("Output resolution", initial_value="1920 × 1080 · 16:9", disabled=True)
             final_fps = client.gui.add_number("Output FPS", initial_value=24, min=1, max=120, step=1)
             final_crf = client.gui.add_slider("H.264 quality (CRF)", min=10, max=35, step=1, initial_value=18)
@@ -877,11 +982,15 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     )
                 )
                 sensor_width_mm, sensor_height_mm, _ = lens_values()
-                focal_mm = fov_y_to_focal_length(float(client.camera.fov), sensor_height_mm)
+                focal_mm = shot_fov_y_to_focal_length(
+                    float(client.camera.fov), sensor_width_mm, sensor_height_mm, current_aspect()
+                )
                 filmback_lens.value = (sensor_width_mm, sensor_height_mm, focal_mm)
                 field_of_view.value = (
                     math.degrees(float(client.camera.fov)),
-                    math.degrees(focal_length_to_fov_y(focal_mm, sensor_width_mm)),
+                    math.degrees(
+                        2.0 * math.atan(math.tan(float(client.camera.fov) * 0.5) * current_aspect())
+                    ),
                 )
                 equivalent_focal.value = focal_length_to_full_frame_equivalent(focal_mm, sensor_width_mm)
                 update_coordinate_text()
@@ -900,7 +1009,10 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                         {
                             "frame": key.shot_frame,
                             "focal_mm": round(
-                                fov_y_to_focal_length(key.fov_y, lens_values()[1]), 4
+                                shot_fov_y_to_focal_length(
+                                    key.fov_y, lens_values()[0], lens_values()[1], current_aspect()
+                                ),
+                                4,
                             ),
                             "fov_degrees": round(math.degrees(key.fov_y), 4),
                         }
@@ -918,14 +1030,24 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 return
             ordered = sorted(keyframes, key=lambda item: item.shot_frame)
             if len(ordered) > 1:
+                sampled = np.asarray(
+                    [
+                        interpolate_keyframes(
+                            ordered,
+                            frame,
+                            smooth=str(shot_interpolation.value) == "Smooth ease",
+                        ).position
+                        for frame in range(shot_length())
+                    ],
+                    dtype=np.float32,
+                )
+                segments = np.stack((sampled[:-1], sampled[1:]), axis=1)
                 path_handles.append(
-                    client.scene.add_spline_catmull_rom(
+                    client.scene.add_line_segments(
                         "/cinematic/camera_path",
-                        points=np.asarray([key.position for key in ordered]),
-                        curve_type="centripetal",
-                        tension=0.5,
+                        points=segments,
                         line_width=3.0,
-                        color=(155, 124, 255),
+                        colors=(155, 124, 255),
                     )
                 )
             for index, key in enumerate(ordered):
@@ -949,6 +1071,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             shot_aspect = current_aspect()
             preview_framing = bool(match_preview_aspect.value)
             aspect = canvas_aspect
+            render_fov_y = float(client.camera.fov)
+            if preview_framing:
+                render_fov_y = preview_fov_y_for_gate(render_fov_y, canvas_aspect, shot_aspect)
             if str(preview_resolution_mode.value) == "Match viewport":
                 preview_width = int(np.clip(canvas_width, 64, args.max_width))
             else:
@@ -956,11 +1081,15 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             return CameraSnapshot(
                 wxyz=np.asarray(client.camera.wxyz, dtype=np.float64).copy(),
                 position=np.asarray(client.camera.position, dtype=np.float64).copy(),
-                fov_y=float(client.camera.fov),
+                fov_y=render_fov_y,
                 aspect=aspect,
                 canvas_width=canvas_width,
                 canvas_height=canvas_height,
-                frame=int(frame_slider.value),
+                frame=(
+                    state.dynamic_frame_override
+                    if state.dynamic_frame_override is not None
+                    else float(frame_slider.value)
+                ),
                 render_width=preview_width,
                 shot_aspect=shot_aspect,
                 viewport_aspect=canvas_aspect,
@@ -979,7 +1108,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 sync_camera_gui()
             request_render()
 
-        frame_slider.on_update(request_render)
+        @frame_slider.on_update
+        def _(_: Any) -> None:
+            if not gui_guard:
+                state.dynamic_frame_override = None
+            request_render()
         render_width.on_update(request_render)
         match_preview_aspect.on_update(request_render)
         matte_opacity.on_update(request_render)
@@ -1018,7 +1151,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     sensor_preset.value = "Custom gate"
                 finally:
                     gui_guard = False
-            client.camera.fov = focal_length_to_fov_y(focal_mm, sensor_height_mm)
+            client.camera.fov = focal_length_to_shot_fov_y(
+                focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
+            )
 
         @field_of_view.on_update
         def _(_: Any) -> None:
@@ -1027,13 +1162,13 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             sensor_width_mm, sensor_height_mm, _ = lens_values()
             requested = np.clip(np.asarray(field_of_view.value, dtype=np.float64), 1.0, 179.0)
             current_vertical = math.degrees(float(client.camera.fov))
-            current_focal = fov_y_to_focal_length(float(client.camera.fov), sensor_height_mm)
             current_horizontal = math.degrees(
-                focal_length_to_fov_y(current_focal, sensor_width_mm)
+                2.0 * math.atan(math.tan(float(client.camera.fov) * 0.5) * current_aspect())
             )
             if abs(float(requested[1]) - current_horizontal) > abs(float(requested[0]) - current_vertical):
-                focal_mm = fov_y_to_focal_length(math.radians(float(requested[1])), sensor_width_mm)
-                client.camera.fov = focal_length_to_fov_y(focal_mm, sensor_height_mm)
+                client.camera.fov = 2.0 * math.atan(
+                    math.tan(math.radians(float(requested[1])) * 0.5) / current_aspect()
+                )
             else:
                 client.camera.fov = math.radians(float(requested[0]))
 
@@ -1055,7 +1190,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 filmback_lens.value = (sensor_width_mm, sensor_height_mm, focal_mm)
             finally:
                 gui_guard = False
-            client.camera.fov = focal_length_to_fov_y(focal_mm, sensor_height_mm)
+            client.camera.fov = focal_length_to_shot_fov_y(
+                focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
+            )
 
         @sensor_preset.on_update
         def _(_: Any) -> None:
@@ -1069,7 +1206,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 filmback_lens.value = (preset[0], preset[1], current_focal)
             finally:
                 gui_guard = False
-            client.camera.fov = focal_length_to_fov_y(current_focal, preset[1])
+            client.camera.fov = focal_length_to_shot_fov_y(
+                current_focal, preset[0], preset[1], current_aspect()
+            )
 
         @toggle_playback.on_trigger
         def _(_: Any) -> None:
@@ -1089,6 +1228,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             nonlocal gui_guard
             key = interpolate_keyframes(keyframes, target_frame, str(shot_interpolation.value) == "Smooth ease")
             dynamic_frame = scene_frame_for_shot(target_frame, float(final_fps.value), args.frames, time_duration)
+            state.dynamic_frame_override = dynamic_frame
             gui_guard = True
             try:
                 with client.atomic():
@@ -1153,18 +1293,43 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             if len(keyframes) <= 1:
                 final_status.value = "A shot must keep at least one keyframe"
                 return
-            try:
-                selected_frame = int(str(keyframe_select.value).split()[-1])
-            except (ValueError, IndexError):
+            selected_frame = int(shot_frame.value)
+            if not any(key.shot_frame == selected_frame for key in keyframes):
+                final_status.value = f"No camera keyframe at frame {selected_frame}"
                 return
             keyframes[:] = [key for key in keyframes if key.shot_frame != selected_frame]
             refresh_keyframe_gui()
             refresh_camera_path()
+            final_status.value = f"Deleted camera keyframe {selected_frame}"
 
         show_camera_path.on_update(lambda _: refresh_camera_path())
+        shot_interpolation.on_update(lambda _: refresh_camera_path())
 
         @aspect_preset.on_update
         def _(_: Any) -> None:
+            nonlocal gui_guard, last_shot_aspect
+            new_aspect = current_aspect()
+            sensor_width_mm, sensor_height_mm, _ = lens_values()
+            current_focal = shot_fov_y_to_focal_length(
+                float(client.camera.fov), sensor_width_mm, sensor_height_mm, last_shot_aspect
+            )
+            for key in keyframes:
+                focal_mm = shot_fov_y_to_focal_length(
+                    key.fov_y, sensor_width_mm, sensor_height_mm, last_shot_aspect
+                )
+                key.fov_y = focal_length_to_shot_fov_y(
+                    focal_mm, sensor_width_mm, sensor_height_mm, new_aspect
+                )
+            last_shot_aspect = new_aspect
+            gui_guard = True
+            try:
+                client.camera.fov = focal_length_to_shot_fov_y(
+                    current_focal, sensor_width_mm, sensor_height_mm, new_aspect
+                )
+            finally:
+                gui_guard = False
+            sync_camera_gui()
+            refresh_keyframe_gui()
             refresh_camera_path()
             update_output_resolution()
             request_render()
@@ -1178,6 +1343,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             export_sensor_width: float | None = None,
             export_sensor_height: float | None = None,
             export_shot_aspect: float | None = None,
+            export_duration_frames: int | None = None,
+            export_interpolation: str | None = None,
         ) -> tuple[str, bytes]:
             safe_name = "".join(character if character.isalnum() or character in "-_" else "_" for character in str(shot_name.value)).strip("_") or "camera_shot"
             selected_format = selected_format or str(export_format.value)
@@ -1187,16 +1354,37 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             export_sensor_width = export_sensor_width or sensor_width_mm
             export_sensor_height = export_sensor_height or sensor_height_mm
             export_shot_aspect = export_shot_aspect or current_aspect()
+            export_duration_frames = export_duration_frames or shot_length()
+            smooth = (export_interpolation or str(shot_interpolation.value)) == "Smooth ease"
+            source_keys = export_keyframes(source_keys, export_duration_frames, smooth)
             if selected_format == "USD ASCII":
                 return f"{safe_name}.usda", shot_to_usda_bytes(
-                    safe_name, export_fps_value, source_keys, export_sensor_width, export_sensor_height, export_shot_aspect
+                    safe_name,
+                    export_fps_value,
+                    source_keys,
+                    export_sensor_width,
+                    export_sensor_height,
+                    export_shot_aspect,
+                    export_duration_frames,
                 )
             if selected_format == "4C4D JSON":
                 return f"{safe_name}.camera.json", shot_to_json_bytes(
-                    safe_name, export_fps_value, source_keys, export_sensor_width, export_sensor_height, export_shot_aspect
+                    safe_name,
+                    export_fps_value,
+                    source_keys,
+                    export_sensor_width,
+                    export_sensor_height,
+                    export_shot_aspect,
+                    export_duration_frames,
                 )
             return f"{safe_name}.gltf", shot_to_gltf_bytes(
-                safe_name, export_fps_value, source_keys, export_sensor_width, export_sensor_height, export_shot_aspect
+                safe_name,
+                export_fps_value,
+                source_keys,
+                export_sensor_width,
+                export_sensor_height,
+                export_shot_aspect,
+                export_duration_frames,
             )
 
         @export_camera.on_click
@@ -1264,6 +1452,13 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                                 progress_callback=update_progress,
                                 cancelled=state.render_cancel,
                             )
+                        output_size = output_path.stat().st_size
+                        max_download_size = 256 * 1024 * 1024
+                        if output_size > max_download_size:
+                            raise RuntimeError(
+                                f"MP4 is {output_size / (1024 * 1024):.1f} MiB; "
+                                "the browser download limit is 256 MiB. Lower output width or raise CRF."
+                            )
                         client.send_file_download(output_path.name, output_path.read_bytes(), save_immediately=True)
                         if str(render_settings["sidecar"]) != "None":
                             sidecar_name, sidecar_content = camera_export(
@@ -1273,6 +1468,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                                 export_sensor_width=float(render_settings["sensor_width"]),
                                 export_sensor_height=float(render_settings["sensor_height"]),
                                 export_shot_aspect=float(render_settings["shot_aspect"]),
+                                export_duration_frames=int(render_settings["duration"]),
+                                export_interpolation=str(render_settings["interpolation"]),
                             )
                             client.send_file_download(sidecar_name, sidecar_content, save_immediately=True)
                         final_status.value = f"Complete · {output_path.name}"
@@ -1356,7 +1553,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         refresh_keyframe_gui()
         refresh_camera_path()
         update_output_resolution()
-        apply_shot_frame(int(shot_frame.value))
+        request_render()
 
     @server.on_client_disconnect
     def on_disconnect(client: Any) -> None:
@@ -1393,6 +1590,13 @@ def self_test() -> None:
     assert math.isclose(frame_to_timestamp(299, 300, (0.0, 10.0)), 299.0 / 30.0)
     assert math.isclose(full_frame_equivalent_to_focal_length(50.0, 24.89), 34.5694444444)
     assert math.isclose(focal_length_to_full_frame_equivalent(34.5694444444, 24.89), 50.0)
+    gate_width, gate_height = shot_gate_dimensions(24.89, 18.66, 16.0 / 9.0)
+    assert math.isclose(gate_width, 24.89)
+    assert math.isclose(gate_height, 24.89 / (16.0 / 9.0))
+    test_shot_fov = focal_length_to_shot_fov_y(50.0, 24.89, 18.66, 16.0 / 9.0)
+    assert math.isclose(shot_fov_y_to_focal_length(test_shot_fov, 24.89, 18.66, 16.0 / 9.0), 50.0)
+    assert math.isclose(preview_fov_y_for_gate(test_shot_fov, 2.0, 16.0 / 9.0), test_shot_fov)
+    assert preview_fov_y_for_gate(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0) > test_shot_fov
     euler = np.array([12.0, -24.0, 5.0])
     euler_round_trip = rotation_matrix_to_euler_xyz_degrees(
         quaternion_wxyz_to_matrix(euler_xyz_degrees_to_quaternion(euler))
@@ -1405,23 +1609,40 @@ def self_test() -> None:
     midpoint = interpolate_keyframes(test_keys, 12, smooth=False)
     np.testing.assert_allclose(midpoint.position, [1.0, 0.5, 0.0])
     assert scene_frame_for_shot(12, 24, 300, (0.0, 10.0)) == 15.0
-    json_export = json.loads(shot_to_json_bytes("test", 24, test_keys, 24.89, 18.66, 16.0 / 9.0))
+    smooth_export = export_keyframes(test_keys, 30, smooth=True)
+    assert len(smooth_export) == 30 and smooth_export[-1].shot_frame == 29
+    linear_export = export_keyframes(test_keys, 30, smooth=False)
+    assert linear_export[0].shot_frame == 0 and linear_export[-1].shot_frame == 29
+    json_export = json.loads(
+        shot_to_json_bytes("test", 24, linear_export, 24.89, 18.66, 16.0 / 9.0, 30)
+    )
     assert json_export["sensor_width_mm"] == 24.89
     assert math.isclose(json_export["shot_aspect_ratio"], 16.0 / 9.0)
+    assert json_export["duration_frames"] == 30
     assert "horizontal_fov_degrees" in json_export["keyframes"][0]
     assert "scene_frame" not in json_export["keyframes"][0]
     assert "focus_distance" not in json_export["keyframes"][0]
     assert "aperture" not in json_export["keyframes"][0]
-    gltf = json.loads(shot_to_gltf_bytes("test", 24, test_keys, 24.89, 18.66, 16.0 / 9.0))
+    gltf = json.loads(shot_to_gltf_bytes("test", 24, smooth_export, 24.89, 18.66, 16.0 / 9.0, 30))
     assert gltf["asset"]["version"] == "2.0"
     assert math.isclose(gltf["cameras"][0]["perspective"]["aspectRatio"], 16.0 / 9.0)
+    assert gltf["nodes"][0]["children"] == [1]
+    assert gltf["animations"][0]["channels"][0]["target"]["node"] == 1
+    assert (
+        gltf["animations"][0]["channels"][2]["target"]["extensions"]["KHR_animation_pointer"]["pointer"]
+        == "/cameras/0/perspective/yfov"
+    )
+    assert gltf["extras"]["duration_frames"] == 30
     assert "scene_frame" not in gltf["extras"]
     assert "focus_distance" not in gltf["extras"]
     assert "aperture" not in gltf["extras"]
-    usda = shot_to_usda_bytes("test", 24, test_keys, 24.89, 18.66, 16.0 / 9.0)
+    usda = shot_to_usda_bytes("001 hé", 24, linear_export, 24.89, 18.66, 16.0 / 9.0, 30)
     assert b"focusDistance" not in usda
     assert b"fStop" not in usda
     assert b"horizontalAperture = 24.89" in usda
+    assert b'defaultPrim = "_001_h_"' in usda
+    assert b"endTimeCode = 29" in usda
+    assert f"verticalAperture = {gate_height}".encode() in usda
     preview_wide = np.full((180, 320, 3), 200, dtype=np.uint8)
     framed = compose_framed_preview(preview_wide, 16.0 / 9.0, 4.0 / 3.0, 0.75, True, True)
     assert framed.shape == preview_wide.shape
