@@ -26,6 +26,8 @@ import numpy as np
 
 
 OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0])
+MIN_FOCAL_LENGTH_MM = 1.0
+MAX_FOCAL_LENGTH_MM = 500.0
 
 
 def quaternion_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
@@ -846,28 +848,39 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         }
         sensor_preset_default = "Super 35 · 4-perf (24.89 × 18.66)"
         sensor_width_default, sensor_height_default = sensor_presets[sensor_preset_default]  # type: ignore[misc]
-        initial_focal = shot_fov_y_to_focal_length(
-            initial_reference.fov_y,
-            sensor_width_default,
-            sensor_height_default,
-            initial_shot_aspect,
+        initial_focal = float(
+            np.clip(
+                shot_fov_y_to_focal_length(
+                    initial_reference.fov_y,
+                    sensor_width_default,
+                    sensor_height_default,
+                    initial_shot_aspect,
+                ),
+                MIN_FOCAL_LENGTH_MM,
+                MAX_FOCAL_LENGTH_MM,
+            )
         )
+        initial_shot_fov_y = focal_length_to_shot_fov_y(
+            initial_focal, sensor_width_default, sensor_height_default, initial_shot_aspect
+        )
+        client.camera.fov = initial_shot_fov_y
         initial_horizontal_fov = math.degrees(
-            2.0 * math.atan(math.tan(initial_reference.fov_y * 0.5) * initial_shot_aspect)
+            2.0 * math.atan(math.tan(initial_shot_fov_y * 0.5) * initial_shot_aspect)
         )
         shot_duration_default = min(max(args.shot_frames, 2), 600)
         keyframes = [
-            ShotKeyframe(0, initial_wxyz.copy(), initial_position.copy(), initial_reference.fov_y),
+            ShotKeyframe(0, initial_wxyz.copy(), initial_position.copy(), initial_shot_fov_y),
             ShotKeyframe(
                 shot_duration_default - 1,
                 initial_wxyz.copy(),
                 initial_position.copy(),
-                initial_reference.fov_y,
+                initial_shot_fov_y,
             ),
         ]
         path_handles: list[Any] = []
         gui_guard = False
         last_shot_aspect = initial_shot_aspect
+        last_sensor_dimensions = (sensor_width_default, sensor_height_default)
 
         with client.gui.add_folder("4C4D Playback", expand_by_default=False):
             frame_slider = client.gui.add_slider("Frame", min=0, max=args.frames - 1, step=1, initial_value=args.frame)
@@ -898,14 +911,14 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 filmback_lens = client.gui.add_vector3(
                     "Filmback W · H · Focal (mm)",
                     initial_value=(sensor_width_default, sensor_height_default, initial_focal),
-                    min=(1.0, 1.0, 1.0),
-                    max=(100.0, 100.0, 500.0),
+                    min=(1.0, 1.0, MIN_FOCAL_LENGTH_MM),
+                    max=(100.0, 100.0, MAX_FOCAL_LENGTH_MM),
                     step=0.01,
                     hint="Sensor width, sensor height, and focal length",
                 )
                 field_of_view = client.gui.add_vector2(
                     "FOV V · H (degrees)",
-                    initial_value=(math.degrees(initial_reference.fov_y), initial_horizontal_fov),
+                    initial_value=(math.degrees(initial_shot_fov_y), initial_horizontal_fov),
                     min=(1.0, 1.0),
                     max=(179.0, 179.0),
                     step=0.1,
@@ -914,8 +927,12 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 equivalent_focal = client.gui.add_number(
                     "35mm equivalent (mm)",
                     initial_value=focal_length_to_full_frame_equivalent(initial_focal, sensor_width_default),
-                    min=1.0,
-                    max=1000.0,
+                    min=focal_length_to_full_frame_equivalent(
+                        MIN_FOCAL_LENGTH_MM, sensor_width_default
+                    ),
+                    max=focal_length_to_full_frame_equivalent(
+                        MAX_FOCAL_LENGTH_MM, sensor_width_default
+                    ),
                     step=0.1,
                     hint="Editable full-frame-equivalent focal length",
                 )
@@ -966,7 +983,40 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         def lens_values() -> tuple[float, float, float]:
             width, height, focal = np.asarray(filmback_lens.value, dtype=np.float64)
-            return max(float(width), 1.0), max(float(height), 1.0), max(float(focal), 1.0)
+            return (
+                max(float(width), 1.0),
+                max(float(height), 1.0),
+                float(np.clip(float(focal), MIN_FOCAL_LENGTH_MM, MAX_FOCAL_LENGTH_MM)),
+            )
+
+        def lens_fov_bounds(sensor_width_mm: float, sensor_height_mm: float) -> tuple[np.ndarray, np.ndarray]:
+            min_vertical = focal_length_to_shot_fov_y(
+                MAX_FOCAL_LENGTH_MM, sensor_width_mm, sensor_height_mm, current_aspect()
+            )
+            max_vertical = focal_length_to_shot_fov_y(
+                MIN_FOCAL_LENGTH_MM, sensor_width_mm, sensor_height_mm, current_aspect()
+            )
+            min_horizontal = 2.0 * math.atan(math.tan(min_vertical * 0.5) * current_aspect())
+            max_horizontal = 2.0 * math.atan(math.tan(max_vertical * 0.5) * current_aspect())
+            return np.degrees([min_vertical, min_horizontal]), np.degrees(
+                [max_vertical, max_horizontal]
+            )
+
+        def remap_keyframes_for_sensor(sensor_width_mm: float, sensor_height_mm: float) -> None:
+            nonlocal last_sensor_dimensions
+            old_width_mm, old_height_mm = last_sensor_dimensions
+            if np.allclose(
+                (sensor_width_mm, sensor_height_mm), last_sensor_dimensions, atol=1e-6
+            ):
+                return
+            for key in keyframes:
+                focal_mm = shot_fov_y_to_focal_length(
+                    key.fov_y, old_width_mm, old_height_mm, current_aspect()
+                )
+                key.fov_y = focal_length_to_shot_fov_y(
+                    focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
+                )
+            last_sensor_dimensions = (sensor_width_mm, sensor_height_mm)
 
         def update_coordinate_text() -> None:
             position = np.asarray(client.camera.position, dtype=np.float64)
@@ -990,14 +1040,32 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     )
                 )
                 sensor_width_mm, sensor_height_mm, _ = lens_values()
+                minimum_fov, maximum_fov = lens_fov_bounds(sensor_width_mm, sensor_height_mm)
+                field_of_view.min = tuple(float(value) for value in minimum_fov)
+                field_of_view.max = tuple(float(value) for value in maximum_fov)
+                equivalent_focal.min = focal_length_to_full_frame_equivalent(
+                    MIN_FOCAL_LENGTH_MM, sensor_width_mm
+                )
+                equivalent_focal.max = focal_length_to_full_frame_equivalent(
+                    MAX_FOCAL_LENGTH_MM, sensor_width_mm
+                )
+                bounded_fov_y = float(
+                    np.clip(
+                        float(client.camera.fov),
+                        math.radians(float(minimum_fov[0])),
+                        math.radians(float(maximum_fov[0])),
+                    )
+                )
+                if not math.isclose(bounded_fov_y, float(client.camera.fov)):
+                    client.camera.fov = bounded_fov_y
                 focal_mm = shot_fov_y_to_focal_length(
-                    float(client.camera.fov), sensor_width_mm, sensor_height_mm, current_aspect()
+                    bounded_fov_y, sensor_width_mm, sensor_height_mm, current_aspect()
                 )
                 filmback_lens.value = (sensor_width_mm, sensor_height_mm, focal_mm)
                 field_of_view.value = (
-                    math.degrees(float(client.camera.fov)),
+                    math.degrees(bounded_fov_y),
                     math.degrees(
-                        2.0 * math.atan(math.tan(float(client.camera.fov) * 0.5) * current_aspect())
+                        2.0 * math.atan(math.tan(bounded_fov_y * 0.5) * current_aspect())
                     ),
                 )
                 equivalent_focal.value = focal_length_to_full_frame_equivalent(focal_mm, sensor_width_mm)
@@ -1150,6 +1218,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             if gui_guard:
                 return
             sensor_width_mm, sensor_height_mm, focal_mm = lens_values()
+            remap_keyframes_for_sensor(sensor_width_mm, sensor_height_mm)
             preset = sensor_presets[str(sensor_preset.value)]
             if preset is not None and not np.allclose(
                 (sensor_width_mm, sensor_height_mm), preset, atol=1e-5
@@ -1169,7 +1238,10 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             if gui_guard:
                 return
             sensor_width_mm, sensor_height_mm, _ = lens_values()
-            requested = np.clip(np.asarray(field_of_view.value, dtype=np.float64), 1.0, 179.0)
+            minimum_fov, maximum_fov = lens_fov_bounds(sensor_width_mm, sensor_height_mm)
+            requested = np.clip(
+                np.asarray(field_of_view.value, dtype=np.float64), minimum_fov, maximum_fov
+            )
             current_vertical = math.degrees(float(client.camera.fov))
             current_horizontal = math.degrees(
                 2.0 * math.atan(math.tan(float(client.camera.fov) * 0.5) * current_aspect())
@@ -1190,8 +1262,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             focal_mm = float(
                 np.clip(
                     full_frame_equivalent_to_focal_length(float(equivalent_focal.value), sensor_width_mm),
-                    1.0,
-                    500.0,
+                    MIN_FOCAL_LENGTH_MM,
+                    MAX_FOCAL_LENGTH_MM,
                 )
             )
             gui_guard = True
@@ -1210,6 +1282,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             if preset is None or gui_guard:
                 return
             _, _, current_focal = lens_values()
+            remap_keyframes_for_sensor(preset[0], preset[1])
             gui_guard = True
             try:
                 filmback_lens.value = (preset[0], preset[1], current_focal)
@@ -1613,6 +1686,14 @@ def self_test() -> None:
     assert math.isclose(gate_height, 24.89 / (16.0 / 9.0))
     test_shot_fov = focal_length_to_shot_fov_y(50.0, 24.89, 18.66, 16.0 / 9.0)
     assert math.isclose(shot_fov_y_to_focal_length(test_shot_fov, 24.89, 18.66, 16.0 / 9.0), 50.0)
+    for focal_limit in (MIN_FOCAL_LENGTH_MM, MAX_FOCAL_LENGTH_MM):
+        bounded_fov = focal_length_to_shot_fov_y(
+            focal_limit, 24.89, 18.66, 16.0 / 9.0
+        )
+        assert math.isclose(
+            shot_fov_y_to_focal_length(bounded_fov, 24.89, 18.66, 16.0 / 9.0),
+            focal_limit,
+        )
     assert math.isclose(preview_fov_y_for_gate(test_shot_fov, 2.0, 16.0 / 9.0), test_shot_fov)
     assert preview_fov_y_for_gate(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0) > test_shot_fov
     euler = np.array([12.0, -24.0, 5.0])
