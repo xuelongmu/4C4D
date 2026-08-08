@@ -1442,7 +1442,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         @shot_interpolation.on_update
         def _(_: Any) -> None:
             refresh_camera_path()
-            apply_shot_frame(float(shot_frame.value))
+            if state.dynamic_frame_override is not None:
+                apply_shot_frame(float(shot_frame.value))
 
         @final_fps.on_update
         def _(_: Any) -> None:
