@@ -1599,8 +1599,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         def _(_: Any) -> None:
             if state.final_rendering:
                 return
-            if len(keyframes) < 2:
-                final_status.value = "Add at least two camera keyframes before rendering"
+            if not keyframes:
+                final_status.value = "Add a camera keyframe before rendering"
                 return
             state.final_rendering = True
             state.render_cancel.clear()
@@ -1844,6 +1844,8 @@ def self_test() -> None:
     ]
     midpoint = interpolate_keyframes(test_keys, 12, smooth=False)
     np.testing.assert_allclose(midpoint.position, [1.0, 0.5, 0.0])
+    static_hold = interpolate_keyframes([test_keys[0]], 12, smooth=True)
+    np.testing.assert_allclose(static_hold.position, test_keys[0].position)
     assert scene_frame_for_shot(12, 24, 300, (0.0, 10.0)) == 15.0
     smooth_export = export_keyframes(test_keys, 30, smooth=True)
     assert len(smooth_export) == 30 and smooth_export[-1].shot_frame == 29
