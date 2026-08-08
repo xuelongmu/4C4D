@@ -1393,11 +1393,13 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 key.shot_frame = min(key.shot_frame, last_frame)
             deduplicated: dict[int, ShotKeyframe] = {key.shot_frame: key for key in keyframes}
             keyframes[:] = sorted(deduplicated.values(), key=lambda key: key.shot_frame)
-            if int(shot_frame.value) >= shot_length():
+            playhead_clipped = int(shot_frame.value) >= shot_length()
+            if playhead_clipped:
                 shot_frame.value = last_frame
             refresh_keyframe_gui()
             refresh_camera_path()
-            apply_shot_frame(int(shot_frame.value))
+            if playhead_clipped or state.dynamic_frame_override is not None:
+                apply_shot_frame(int(shot_frame.value))
 
         @add_keyframe.on_click
         def _(_: Any) -> None:
