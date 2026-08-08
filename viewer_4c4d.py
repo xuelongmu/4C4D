@@ -316,6 +316,22 @@ def shot_playback_needs_rebase(
     return bool(is_playing) and int(live_frame) != int(last_scheduled_frame)
 
 
+def shot_playback_config_changed(
+    previous_fps: int,
+    previous_duration: int,
+    previous_loop: bool,
+    current_fps: int,
+    current_duration: int,
+    current_loop: bool,
+) -> bool:
+    """Detect timing-topology changes that require a fresh playback anchor."""
+    return (
+        int(previous_fps) != int(current_fps)
+        or int(previous_duration) != int(current_duration)
+        or bool(previous_loop) != bool(current_loop)
+    )
+
+
 def export_keyframes(
     keyframes: list[ShotKeyframe],
     duration_frames: int,
@@ -1892,16 +1908,27 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             shot_started_at: float | None = None
             shot_started_frame = 0
             shot_schedule_fps = 0
+            shot_schedule_duration = 0
+            shot_schedule_loop = False
             last_scheduled_frame = -1
             while state.alive:
                 if bool(preview_shot.value):
                     now = time.monotonic()
                     playback_fps = max(int(final_fps.value), 1)
+                    playback_duration = shot_length()
+                    playback_loop = bool(loop_shot.value)
                     live_frame = int(shot_frame.value)
                     if (
                         not state.shot_playing
                         or shot_started_at is None
-                        or playback_fps != shot_schedule_fps
+                        or shot_playback_config_changed(
+                            shot_schedule_fps,
+                            shot_schedule_duration,
+                            shot_schedule_loop,
+                            playback_fps,
+                            playback_duration,
+                            playback_loop,
+                        )
                         or shot_playback_needs_rebase(
                             state.shot_playing,
                             live_frame,
@@ -1912,13 +1939,15 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                         shot_started_at = now
                         shot_started_frame = live_frame
                         shot_schedule_fps = playback_fps
+                        shot_schedule_duration = playback_duration
+                        shot_schedule_loop = playback_loop
                         last_scheduled_frame = shot_started_frame
                     next_frame, finished = scheduled_shot_frame(
                         shot_started_frame,
                         now - shot_started_at,
                         shot_schedule_fps,
-                        shot_length(),
-                        bool(loop_shot.value),
+                        shot_schedule_duration,
+                        shot_schedule_loop,
                     )
                     if next_frame != last_scheduled_frame:
                         shot_frame.value = next_frame
@@ -2037,6 +2066,10 @@ def self_test() -> None:
     assert not shot_playback_needs_rebase(False, 12, 8)
     assert not shot_playback_needs_rebase(True, 12, 12)
     assert shot_playback_needs_rebase(True, 18, 12)
+    assert not shot_playback_config_changed(24, 120, True, 24, 120, True)
+    assert shot_playback_config_changed(24, 120, True, 30, 120, True)
+    assert shot_playback_config_changed(24, 120, True, 24, 90, True)
+    assert shot_playback_config_changed(24, 120, True, 24, 120, False)
     euler = np.array([12.0, -24.0, 5.0])
     euler_round_trip = rotation_matrix_to_euler_xyz_degrees(
         quaternion_wxyz_to_matrix(euler_xyz_degrees_to_quaternion(euler))
