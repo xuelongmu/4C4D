@@ -55,7 +55,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     
     if args.opacity_decay:
-        coefficient = Coefficient().cuda()
+        coefficient = Coefficient(hidden_dim=args.hidden_dim, dropout_rate=args.dropout_rate).cuda()
     else:
         coefficient = None
         
