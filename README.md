@@ -206,9 +206,12 @@ X/Y orbit and move inversion settings.
 
 The **Cinematic Shot** panel turns the free camera into a shot camera. Set the
 shot cursor, navigate or enter an exact XYZ/Euler pose, choose the lens, then
-select **Add / update keyframe**. Scrubbing or enabling **Preview camera move**
-evaluates the interpolated camera path while the dynamic splat advances with
-the same elapsed timeline time.
+select **Add / update keyframe**. Scrubbing or enabling **Play shot timeline**
+advances the dynamic splat with the same elapsed timeline time. The sequencer
+camera lock is off by default, allowing free viewport navigation during
+playback; enable **Lock camera to shot** (or press **L** over the sequencer) to
+preview the interpolated keyed camera move. Unlocking leaves the camera free
+while the playhead and dynamic splat continue playing.
 The viewport can show the 3D path, key-camera frustums, rule-of-thirds guides,
 an action-safe frame, and common cinematic aspect ratios.
 The docked cinematic sequencer provides a frame ruler, draggable playhead,

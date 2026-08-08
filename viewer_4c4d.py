@@ -971,7 +971,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             shot_duration = client.gui.add_number("Duration (frames)", initial_value=shot_duration_default, min=2, max=600, step=1)
             shot_frame = client.gui.add_slider("Shot frame", min=0, max=599, step=1, initial_value=0)
             shot_interpolation = client.gui.add_dropdown("Interpolation", ("Smooth ease", "Linear"), initial_value="Smooth ease")
-            preview_shot = client.gui.add_checkbox("Preview camera move", initial_value=False)
+            preview_shot = client.gui.add_checkbox("Play shot timeline", initial_value=False)
+            lock_camera_to_shot = client.gui.add_checkbox("Lock camera to shot", initial_value=False)
             loop_shot = client.gui.add_checkbox("Loop shot", initial_value=True)
             aspect_preset = client.gui.add_dropdown("Shot framing", tuple(aspect_options), initial_value="16:9 · UHD")
             match_preview_aspect = client.gui.add_checkbox("Preview shot gate", initial_value=True)
@@ -1369,6 +1370,14 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         def _(_: Any) -> None:
             play.value = not bool(play.value)
 
+        @lock_camera_to_shot.on_update
+        def _(_: Any) -> None:
+            if bool(lock_camera_to_shot.value):
+                apply_shot_frame(float(shot_frame.value))
+                final_status.value = "Camera locked to keyed shot"
+            else:
+                final_status.value = "Camera unlocked for free navigation"
+
         @snap_button.on_click
         def _(_: Any) -> None:
             reference = references[str(camera_dropdown.value)]
@@ -1387,11 +1396,13 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             gui_guard = True
             try:
                 with client.atomic():
-                    client.camera.wxyz = key.wxyz
-                    client.camera.position = key.position
-                    client.camera.fov = key.fov_y
+                    if bool(lock_camera_to_shot.value):
+                        client.camera.wxyz = key.wxyz
+                        client.camera.position = key.position
+                        client.camera.fov = key.fov_y
                     frame_slider.value = int(round(dynamic_frame))
-                sync_camera_gui()
+                if bool(lock_camera_to_shot.value):
+                    sync_camera_gui()
             finally:
                 gui_guard = False
             request_render()
