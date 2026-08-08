@@ -238,13 +238,14 @@ def export_keyframes(
     keyframes: list[ShotKeyframe],
     duration_frames: int,
     smooth: bool,
+    bake_every_frame: bool = False,
 ) -> list[ShotKeyframe]:
     """Bake smooth motion per frame and ensure every sidecar reaches the shot tail."""
     duration_frames = max(int(duration_frames), 1)
-    if smooth:
+    if smooth or bake_every_frame:
         baked: list[ShotKeyframe] = []
         for frame in range(duration_frames):
-            key = interpolate_keyframes(keyframes, frame, smooth=True)
+            key = interpolate_keyframes(keyframes, frame, smooth=smooth)
             baked.append(ShotKeyframe(frame, key.wxyz.copy(), key.position.copy(), key.fov_y))
         return baked
     ordered = [
@@ -1512,7 +1513,12 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             export_shot_aspect = export_shot_aspect or current_aspect()
             export_duration_frames = export_duration_frames or shot_length()
             smooth = (export_interpolation or str(shot_interpolation.value)) == "Smooth ease"
-            source_keys = export_keyframes(source_keys, export_duration_frames, smooth)
+            source_keys = export_keyframes(
+                source_keys,
+                export_duration_frames,
+                smooth,
+                bake_every_frame=selected_format == "USD ASCII",
+            )
             if selected_format == "USD ASCII":
                 return f"{safe_name}.usda", shot_to_usda_bytes(
                     safe_name,
@@ -1802,6 +1808,10 @@ def self_test() -> None:
     assert len(smooth_export) == 30 and smooth_export[-1].shot_frame == 29
     linear_export = export_keyframes(test_keys, 30, smooth=False)
     assert linear_export[0].shot_frame == 0 and linear_export[-1].shot_frame == 29
+    linear_baked_export = export_keyframes(
+        test_keys, 30, smooth=False, bake_every_frame=True
+    )
+    assert len(linear_baked_export) == 30 and linear_baked_export[12].shot_frame == 12
     json_export = json.loads(
         shot_to_json_bytes("test", 24, linear_export, 24.89, 18.66, 16.0 / 9.0, 30)
     )
@@ -1825,7 +1835,9 @@ def self_test() -> None:
     assert "scene_frame" not in gltf["extras"]
     assert "focus_distance" not in gltf["extras"]
     assert "aperture" not in gltf["extras"]
-    usda = shot_to_usda_bytes("001 hé", 24, linear_export, 24.89, 18.66, 16.0 / 9.0, 30)
+    usda = shot_to_usda_bytes(
+        "001 hé", 24, linear_baked_export, 24.89, 18.66, 16.0 / 9.0, 30
+    )
     assert b"focusDistance" not in usda
     assert b"fStop" not in usda
     assert b"horizontalAperture = 24.89" in usda
@@ -1835,6 +1847,7 @@ def self_test() -> None:
     assert b"double3 xformOp:translate.timeSamples" in usda
     assert b"quatd xformOp:orient.timeSamples" in usda
     assert b"matrix4d" not in usda
+    assert b"            12:" in usda
     preview_wide = np.full((180, 320, 3), 200, dtype=np.uint8)
     framed = compose_framed_preview(preview_wide, 16.0 / 9.0, 4.0 / 3.0, 0.75, True, True)
     assert framed.shape == preview_wide.shape
