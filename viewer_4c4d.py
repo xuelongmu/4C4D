@@ -1319,6 +1319,10 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             refresh_camera_path()
             apply_shot_frame(float(shot_frame.value))
 
+        @final_fps.on_update
+        def _(_: Any) -> None:
+            apply_shot_frame(float(shot_frame.value))
+
         @aspect_preset.on_update
         def _(_: Any) -> None:
             nonlocal gui_guard, last_shot_aspect
