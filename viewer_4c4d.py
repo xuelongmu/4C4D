@@ -1497,8 +1497,12 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             export_shot_aspect: float | None = None,
             export_duration_frames: int | None = None,
             export_interpolation: str | None = None,
+            export_name: str | None = None,
         ) -> tuple[str, bytes]:
-            safe_name = "".join(character if character.isalnum() or character in "-_" else "_" for character in str(shot_name.value)).strip("_") or "camera_shot"
+            safe_name = "".join(
+                character if character.isalnum() or character in "-_" else "_"
+                for character in (export_name if export_name is not None else str(shot_name.value))
+            ).strip("_") or "camera_shot"
             selected_format = selected_format or str(export_format.value)
             source_keys = source_keys or keyframes
             export_fps_value = export_fps_value or int(final_fps.value)
@@ -1574,10 +1578,14 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 "sensor_width": lens_values()[0],
                 "sensor_height": lens_values()[1],
                 "shot_aspect": current_aspect(),
+                "shot_name": str(shot_name.value),
             }
 
             def final_render_worker() -> None:
-                safe_name = "".join(character if character.isalnum() or character in "-_" else "_" for character in str(shot_name.value)).strip("_") or "camera_shot"
+                safe_name = "".join(
+                    character if character.isalnum() or character in "-_" else "_"
+                    for character in str(render_settings["shot_name"])
+                ).strip("_") or "camera_shot"
                 try:
                     with tempfile.TemporaryDirectory(prefix="4c4d-shot-") as temp_dir:
                         output_path = Path(temp_dir) / f"{safe_name}.mp4"
@@ -1622,6 +1630,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                                 export_shot_aspect=float(render_settings["shot_aspect"]),
                                 export_duration_frames=int(render_settings["duration"]),
                                 export_interpolation=str(render_settings["interpolation"]),
+                                export_name=str(render_settings["shot_name"]),
                             )
                             client.send_file_download(sidecar_name, sidecar_content, save_immediately=True)
                         final_status.value = f"Complete · {output_path.name}"
