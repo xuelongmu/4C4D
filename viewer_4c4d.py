@@ -1002,13 +1002,13 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 [max_vertical, max_horizontal]
             )
 
-        def remap_keyframes_for_sensor(sensor_width_mm: float, sensor_height_mm: float) -> None:
+        def remap_keyframes_for_sensor(sensor_width_mm: float, sensor_height_mm: float) -> bool:
             nonlocal last_sensor_dimensions
             old_width_mm, old_height_mm = last_sensor_dimensions
             if np.allclose(
                 (sensor_width_mm, sensor_height_mm), last_sensor_dimensions, atol=1e-6
             ):
-                return
+                return False
             for key in keyframes:
                 focal_mm = shot_fov_y_to_focal_length(
                     key.fov_y, old_width_mm, old_height_mm, current_aspect()
@@ -1017,6 +1017,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
                 )
             last_sensor_dimensions = (sensor_width_mm, sensor_height_mm)
+            return True
 
         def update_coordinate_text() -> None:
             position = np.asarray(client.camera.position, dtype=np.float64)
@@ -1218,8 +1219,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             nonlocal gui_guard
             if gui_guard:
                 return
+            following_shot = state.dynamic_frame_override is not None
             sensor_width_mm, sensor_height_mm, focal_mm = lens_values()
-            remap_keyframes_for_sensor(sensor_width_mm, sensor_height_mm)
+            sensor_changed = remap_keyframes_for_sensor(sensor_width_mm, sensor_height_mm)
             preset = sensor_presets[str(sensor_preset.value)]
             if preset is not None and not np.allclose(
                 (sensor_width_mm, sensor_height_mm), preset, atol=1e-5
@@ -1229,9 +1231,12 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     sensor_preset.value = "Custom gate"
                 finally:
                     gui_guard = False
-            client.camera.fov = focal_length_to_shot_fov_y(
-                focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
-            )
+            if sensor_changed and following_shot:
+                apply_shot_frame(float(shot_frame.value))
+            else:
+                client.camera.fov = focal_length_to_shot_fov_y(
+                    focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
+                )
             refresh_keyframe_gui()
 
         @field_of_view.on_update
@@ -1282,6 +1287,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             preset = sensor_presets[str(sensor_preset.value)]
             if preset is None or gui_guard:
                 return
+            following_shot = state.dynamic_frame_override is not None
             _, _, current_focal = lens_values()
             remap_keyframes_for_sensor(preset[0], preset[1])
             gui_guard = True
@@ -1289,9 +1295,12 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 filmback_lens.value = (preset[0], preset[1], current_focal)
             finally:
                 gui_guard = False
-            client.camera.fov = focal_length_to_shot_fov_y(
-                current_focal, preset[0], preset[1], current_aspect()
-            )
+            if following_shot:
+                apply_shot_frame(float(shot_frame.value))
+            else:
+                client.camera.fov = focal_length_to_shot_fov_y(
+                    current_focal, preset[0], preset[1], current_aspect()
+                )
             refresh_keyframe_gui()
 
         @toggle_playback.on_trigger
@@ -1401,6 +1410,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         @aspect_preset.on_update
         def _(_: Any) -> None:
             nonlocal gui_guard, last_shot_aspect
+            following_shot = state.dynamic_frame_override is not None
             new_aspect = current_aspect()
             sensor_width_mm, sensor_height_mm, _ = lens_values()
             current_focal = shot_fov_y_to_focal_length(
@@ -1414,14 +1424,17 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     focal_mm, sensor_width_mm, sensor_height_mm, new_aspect
                 )
             last_shot_aspect = new_aspect
-            gui_guard = True
-            try:
-                client.camera.fov = focal_length_to_shot_fov_y(
-                    current_focal, sensor_width_mm, sensor_height_mm, new_aspect
-                )
-            finally:
-                gui_guard = False
-            sync_camera_gui()
+            if following_shot:
+                apply_shot_frame(float(shot_frame.value))
+            else:
+                gui_guard = True
+                try:
+                    client.camera.fov = focal_length_to_shot_fov_y(
+                        current_focal, sensor_width_mm, sensor_height_mm, new_aspect
+                    )
+                finally:
+                    gui_guard = False
+                sync_camera_gui()
             refresh_keyframe_gui()
             refresh_camera_path()
             update_output_resolution()
