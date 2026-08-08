@@ -78,6 +78,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
     
     best_psnr = 0.0
+    has_test_views = len(scene.getValidationCameras(tag='test')) > 0
+    if not has_test_views:
+        print("No held-out test views: chkpnt_best.pth will not be written")
     ema_loss_for_log = 0.0
     ema_l1loss_for_log = 0.0
     ema_ssimloss_for_log = 0.0
@@ -268,8 +271,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         env_map_optimizer.step()
                         env_map_optimizer.zero_grad(set_to_none = True)
                         
-                # Save chkpnt
-                if (iteration in testing_iterations):
+                # Save chkpnt. Without held-out test views there is no metric to
+                # rank checkpoints by, and test_psnr stays 0.0, which would
+                # rewrite chkpnt_best.pth at every test iteration.
+                if (iteration in testing_iterations) and has_test_views:
                     if test_psnr >= best_psnr:
                         best_psnr = test_psnr
                         print("\n[ITER {}] Saving best checkpoint".format(iteration))
