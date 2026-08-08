@@ -409,21 +409,26 @@ def shot_to_usda_bytes(
     gate_width_mm, gate_height_mm = shot_gate_dimensions(
         sensor_width_mm, sensor_height_mm, shot_aspect
     )
-    matrix_samples: list[str] = []
+    translation_samples: list[str] = []
+    orientation_samples: list[str] = []
     focal_samples: list[str] = []
     for key in ordered:
-        c2w = np.eye(4, dtype=np.float64)
-        c2w[:3, :3] = quaternion_wxyz_to_matrix(key.wxyz)
-        c2w[:3, 3] = key.position
-        rows = ", ".join("(" + ", ".join(f"{value:.9g}" for value in row) + ")" for row in c2w.T)
-        matrix_samples.append(f"            {key.shot_frame}: ({rows})")
+        position = ", ".join(f"{value:.9g}" for value in key.position)
+        quaternion = np.asarray(key.wxyz, dtype=np.float64)
+        quaternion /= np.linalg.norm(quaternion)
+        imaginary = ", ".join(f"{value:.9g}" for value in quaternion[1:])
+        translation_samples.append(f"            {key.shot_frame}: ({position})")
+        orientation_samples.append(
+            f"            {key.shot_frame}: ({quaternion[0]:.9g}, ({imaginary}))"
+        )
         focal_samples.append(
             f"            {key.shot_frame}: {shot_fov_y_to_focal_length(key.fov_y, sensor_width_mm, sensor_height_mm, shot_aspect):.9g}"
         )
     safe_name = re.sub(r"[^A-Za-z0-9_]", "_", name) or "CameraShot"
     if not re.match(r"[A-Za-z_]", safe_name[0]):
         safe_name = "_" + safe_name
-    matrix_sample_text = ",\n".join(matrix_samples)
+    translation_sample_text = ",\n".join(translation_samples)
+    orientation_sample_text = ",\n".join(orientation_samples)
     focal_sample_text = ",\n".join(focal_samples)
     text = f'''#usda 1.0
 (
@@ -436,10 +441,13 @@ def shot_to_usda_bytes(
 
 def Camera "{safe_name}"
 {{
-    matrix4d xformOp:transform.timeSamples = {{
-{matrix_sample_text}
+    double3 xformOp:translate.timeSamples = {{
+{translation_sample_text}
     }}
-    uniform token[] xformOpOrder = ["xformOp:transform"]
+    quatd xformOp:orient.timeSamples = {{
+{orientation_sample_text}
+    }}
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
     float focalLength.timeSamples = {{
 {focal_sample_text}
     }}
@@ -1643,6 +1651,9 @@ def self_test() -> None:
     assert b'defaultPrim = "_001_h_"' in usda
     assert b"endTimeCode = 29" in usda
     assert f"verticalAperture = {gate_height}".encode() in usda
+    assert b"double3 xformOp:translate.timeSamples" in usda
+    assert b"quatd xformOp:orient.timeSamples" in usda
+    assert b"matrix4d" not in usda
     preview_wide = np.full((180, 320, 3), 200, dtype=np.uint8)
     framed = compose_framed_preview(preview_wide, 16.0 / 9.0, 4.0 / 3.0, 0.75, True, True)
     assert framed.shape == preview_wide.shape
