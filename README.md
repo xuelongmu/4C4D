@@ -182,6 +182,28 @@ python render.py \
   --start_checkpoint output/N3V/$SCENE/chkpnt30000.pth
 ```
 
+#### Interactive 4D viewer
+
+`viewer_4c4d.py` uses the native 4C4D CUDA rasterizer behind a Viser browser UI,
+so camera motion and the frame slider preserve the learned temporal Gaussians.
+
+```bash
+pip install -r requirements-viewer.txt
+
+python viewer_4c4d.py \
+  --config configs/dynerf/flame_steak.yaml \
+  --checkpoint output/N3V/flame_steak/run-4view/chkpnt_best.pth \
+  --training-views 1,10,13,20 \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+Open `http://localhost:8080` on the same machine. This also works when the
+server runs in WSL2 and the browser runs on Windows. Use `--width` to trade
+interactive resolution for frame rate. Space toggles playback. The bundled
+viewer controls provide persistent look sensitivity, independent X/Y orbit
+inversion, and vertical RMB-move inversion settings.
+
 ### 5. Evaluation
 
 Evaluate on held-out test views:
