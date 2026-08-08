@@ -891,15 +891,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             2.0 * math.atan(math.tan(initial_shot_fov_y * 0.5) * initial_shot_aspect)
         )
         shot_duration_default = min(max(args.shot_frames, 2), 600)
-        keyframes = [
-            ShotKeyframe(0, initial_wxyz.copy(), initial_position.copy(), initial_shot_fov_y),
-            ShotKeyframe(
-                shot_duration_default - 1,
-                initial_wxyz.copy(),
-                initial_position.copy(),
-                initial_shot_fov_y,
-            ),
-        ]
+        keyframes: list[ShotKeyframe] = []
         path_handles: list[Any] = []
         gui_guard = False
         last_shot_aspect = initial_shot_aspect
@@ -989,7 +981,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             rule_of_thirds = client.gui.add_checkbox("Rule of thirds", initial_value=False)
             action_safe = client.gui.add_checkbox("Action-safe frame", initial_value=False)
             show_camera_path = client.gui.add_checkbox("Show camera path", initial_value=True)
-            keyframe_select = client.gui.add_dropdown("Keyframes", ("Frame 0", f"Frame {shot_duration_default - 1}"), initial_value="Frame 0")
+            keyframe_select = client.gui.add_dropdown(
+                "Keyframes", ("No keyframes",), initial_value="No keyframes", disabled=True
+            )
             sequencer_data = client.gui.add_text("Sequencer key data", initial_value="{}", disabled=True)
             add_keyframe = client.gui.add_button("Add / update keyframe", color="violet")
             delete_keyframe = client.gui.add_button("Delete selected keyframe")
@@ -1132,10 +1126,14 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         def refresh_keyframe_gui() -> None:
             ordered = sorted(keyframes, key=lambda item: item.shot_frame)
-            labels = tuple(f"Frame {key.shot_frame}" for key in ordered)
+            labels = tuple(f"Frame {key.shot_frame}" for key in ordered) or ("No keyframes",)
             keyframe_select.options = labels
-            selected = f"Frame {int(shot_frame.value)}"
-            keyframe_select.value = selected if selected in labels else labels[0]
+            keyframe_select.disabled = not ordered
+            if ordered:
+                selected = f"Frame {int(shot_frame.value)}"
+                keyframe_select.value = selected if selected in labels else labels[0]
+            else:
+                keyframe_select.value = "No keyframes"
             sequencer_data.value = json.dumps(
                 {
                     "keys": [
@@ -1411,7 +1409,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         def _(_: Any) -> None:
             if bool(lock_camera_to_shot.value):
                 apply_shot_frame(float(shot_frame.value))
-                final_status.value = "Camera locked to keyed shot"
+                final_status.value = (
+                    "Camera locked to keyed shot"
+                    if keyframes
+                    else "Camera lock armed · add a keyframe to create a shot"
+                )
             else:
                 final_status.value = "Camera unlocked for free navigation"
 
@@ -1427,18 +1429,26 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         def apply_shot_frame(target_frame: float) -> None:
             nonlocal gui_guard
-            key = interpolate_keyframes(keyframes, target_frame, str(shot_interpolation.value) == "Smooth ease")
+            key = (
+                interpolate_keyframes(
+                    keyframes,
+                    target_frame,
+                    str(shot_interpolation.value) == "Smooth ease",
+                )
+                if keyframes
+                else None
+            )
             dynamic_frame = scene_frame_for_shot(target_frame, float(final_fps.value), args.frames, time_duration)
             state.dynamic_frame_override = dynamic_frame
             gui_guard = True
             try:
                 with client.atomic():
-                    if bool(lock_camera_to_shot.value):
+                    if bool(lock_camera_to_shot.value) and key is not None:
                         client.camera.wxyz = key.wxyz
                         client.camera.position = key.position
                         client.camera.fov = key.fov_y
                     frame_slider.value = int(round(dynamic_frame))
-                if bool(lock_camera_to_shot.value):
+                if bool(lock_camera_to_shot.value) and key is not None:
                     sync_camera_gui()
             finally:
                 gui_guard = False
@@ -1498,9 +1508,6 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         @delete_keyframe.on_click
         def _(_: Any) -> None:
-            if len(keyframes) <= 1:
-                final_status.value = "A shot must keep at least one keyframe"
-                return
             selected_frame = int(shot_frame.value)
             if not any(key.shot_frame == selected_frame for key in keyframes):
                 final_status.value = f"No camera keyframe at frame {selected_frame}"
@@ -1621,6 +1628,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         @export_camera.on_click
         def _(_: Any) -> None:
+            if not keyframes:
+                final_status.value = "Add a camera keyframe before exporting"
+                return
             filename, content = camera_export()
             client.send_file_download(filename, content, save_immediately=True)
             final_status.value = f"Downloaded {filename}"
