@@ -249,6 +249,23 @@ def preview_projection_matches_scene(
     )
 
 
+def scheduled_shot_frame(
+    start_frame: int,
+    elapsed_seconds: float,
+    fps: int,
+    duration_frames: int,
+    loop: bool,
+) -> tuple[int, bool]:
+    """Map monotonic elapsed time to a shot frame and completion state."""
+    duration_frames = max(int(duration_frames), 1)
+    fps = max(int(fps), 1)
+    elapsed_frames = max(int(math.floor(max(float(elapsed_seconds), 0.0) * fps + 1e-9)), 0)
+    unwrapped_frame = max(int(start_frame), 0) + elapsed_frames
+    if loop:
+        return unwrapped_frame % duration_frames, False
+    return min(unwrapped_frame, duration_frames - 1), unwrapped_frame >= duration_frames
+
+
 def export_keyframes(
     keyframes: list[ShotKeyframe],
     duration_frames: int,
@@ -1818,28 +1835,56 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     print(f"Render failed for client {client.client_id}: {exc}", flush=True)
 
         def playback_worker() -> None:
+            shot_started_at: float | None = None
+            shot_started_frame = 0
+            shot_schedule_fps = 0
+            last_scheduled_frame = -1
             while state.alive:
                 if bool(preview_shot.value):
-                    state.shot_playing = True
-                    next_frame = int(shot_frame.value) + 1
-                    if next_frame >= shot_length():
-                        if bool(loop_shot.value):
-                            next_frame = 0
-                        else:
-                            preview_shot.value = False
-                            state.shot_playing = False
-                            continue
-                    shot_frame.value = next_frame
-                    apply_shot_frame(next_frame)
-                    time.sleep(1.0 / max(int(final_fps.value), 1))
+                    now = time.monotonic()
+                    playback_fps = max(int(final_fps.value), 1)
+                    if (
+                        not state.shot_playing
+                        or shot_started_at is None
+                        or playback_fps != shot_schedule_fps
+                    ):
+                        state.shot_playing = True
+                        shot_started_at = now
+                        shot_started_frame = int(shot_frame.value)
+                        shot_schedule_fps = playback_fps
+                        last_scheduled_frame = shot_started_frame
+                    next_frame, finished = scheduled_shot_frame(
+                        shot_started_frame,
+                        now - shot_started_at,
+                        shot_schedule_fps,
+                        shot_length(),
+                        bool(loop_shot.value),
+                    )
+                    if next_frame != last_scheduled_frame:
+                        shot_frame.value = next_frame
+                        apply_shot_frame(next_frame)
+                        last_scheduled_frame = next_frame
+                    if finished:
+                        preview_shot.value = False
+                        state.shot_playing = False
+                        shot_started_at = None
+                        continue
+                    elapsed_frames = max(
+                        int(math.floor((now - shot_started_at) * shot_schedule_fps + 1e-9)),
+                        0,
+                    )
+                    next_deadline = shot_started_at + (elapsed_frames + 1) / shot_schedule_fps
+                    time.sleep(max(next_deadline - time.monotonic(), 0.001))
                 elif bool(play.value):
                     state.shot_playing = False
+                    shot_started_at = None
                     state.dynamic_frame_override = None
                     frame_slider.value = (int(frame_slider.value) + 1) % args.frames
                     request_render()
                     time.sleep(1.0 / max(int(fps.value), 1))
                 else:
                     state.shot_playing = False
+                    shot_started_at = None
                     time.sleep(0.05)
 
         threading.Thread(target=render_worker, daemon=True, name=f"4c4d-render-{client.client_id}").start()
@@ -1922,6 +1967,10 @@ def self_test() -> None:
     assert preview_projection_matches_scene(test_shot_fov, 2.0, 16.0 / 9.0, True)
     assert not preview_projection_matches_scene(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0, True)
     assert preview_projection_matches_scene(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0, False)
+    assert scheduled_shot_frame(0, 0.0, 24, 48, False) == (0, False)
+    assert scheduled_shot_frame(0, 0.5, 24, 48, False) == (12, False)
+    assert scheduled_shot_frame(47, 1.0 / 24.0, 24, 48, False) == (47, True)
+    assert scheduled_shot_frame(47, 1.0 / 24.0, 24, 48, True) == (0, False)
     euler = np.array([12.0, -24.0, 5.0])
     euler_round_trip = rotation_matrix_to_euler_xyz_degrees(
         quaternion_wxyz_to_matrix(euler_xyz_degrees_to_quaternion(euler))
