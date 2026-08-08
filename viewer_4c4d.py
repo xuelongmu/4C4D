@@ -1313,7 +1313,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             final_status.value = f"Deleted camera keyframe {selected_frame}"
 
         show_camera_path.on_update(lambda _: refresh_camera_path())
-        shot_interpolation.on_update(lambda _: refresh_camera_path())
+
+        @shot_interpolation.on_update
+        def _(_: Any) -> None:
+            refresh_camera_path()
+            apply_shot_frame(float(shot_frame.value))
 
         @aspect_preset.on_update
         def _(_: Any) -> None:
