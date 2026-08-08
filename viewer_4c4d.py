@@ -1006,7 +1006,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             return aspect_options[str(aspect_preset.value)]
 
         def camera_follows_shot() -> bool:
-            return bool(lock_camera_to_shot.value) and state.dynamic_frame_override is not None
+            return (
+                bool(lock_camera_to_shot.value)
+                and bool(keyframes)
+                and state.dynamic_frame_override is not None
+            )
 
         def update_output_resolution() -> None:
             width = max(2, int(final_width.value))
