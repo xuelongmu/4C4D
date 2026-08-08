@@ -1364,6 +1364,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             state = states.pop(client.client_id, None)
         if state is not None:
             state.alive = False
+            state.render_cancel.set()
             state.dirty.set()
 
     print(f"4C4D iteration {iteration:,} viewer ready at http://localhost:{args.port}", flush=True)
