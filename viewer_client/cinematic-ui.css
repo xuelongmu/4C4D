@@ -291,6 +291,13 @@ html:has(#c4d-sequencer.c4d-seq-collapsed) {
   .c4d-seq-dynamic { display: none; }
 }
 
+@media (max-width: 480px) {
+  #c4d-seq-start,
+  #c4d-seq-end,
+  #c4d-seq-add,
+  #c4d-seq-delete { display: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   #c4d-sequencer { transition: none; }
 }
