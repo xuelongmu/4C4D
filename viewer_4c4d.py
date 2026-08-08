@@ -1381,6 +1381,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             clipped = int(np.clip(int(shot_frame.value), 0, shot_length() - 1))
             if clipped != int(shot_frame.value):
                 shot_frame.value = clipped
+                apply_shot_frame(clipped)
                 return
             apply_shot_frame(clipped)
 
@@ -1419,9 +1420,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         @keyframe_select.on_update
         def _(_: Any) -> None:
             try:
-                shot_frame.value = int(str(keyframe_select.value).split()[-1])
+                selected_frame = int(str(keyframe_select.value).split()[-1])
             except (ValueError, IndexError):
                 return
+            shot_frame.value = selected_frame
+            apply_shot_frame(selected_frame)
 
         @delete_keyframe.on_click
         def _(_: Any) -> None:
@@ -1686,9 +1689,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                             state.shot_playing = False
                             continue
                     shot_frame.value = next_frame
+                    apply_shot_frame(next_frame)
                     time.sleep(1.0 / max(int(final_fps.value), 1))
                 elif bool(play.value):
                     state.shot_playing = False
+                    state.dynamic_frame_override = None
                     frame_slider.value = (int(frame_slider.value) + 1) % args.frames
                     request_render()
                     time.sleep(1.0 / max(int(fps.value), 1))
