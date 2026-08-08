@@ -252,8 +252,12 @@
       if (lanes.hasPointerCapture(event.pointerId)) lanes.releasePointerCapture(event.pointerId);
     });
 
-    root.addEventListener("keydown", (event) => {
-      if (event.target.matches("input, textarea, select")) return;
+    let sequencerHovered = false;
+    root.addEventListener("pointerenter", () => { sequencerHovered = true; });
+    root.addEventListener("pointerleave", () => { sequencerHovered = false; });
+    document.addEventListener("keydown", (event) => {
+      if (!sequencerHovered && !root.contains(document.activeElement)) return;
+      if (event.target instanceof Element && event.target.matches("input, textarea, select")) return;
       if (event.code === "Space") {
         event.preventDefault();
         event.stopPropagation();
@@ -265,7 +269,7 @@
         event.preventDefault();
         controlForLabel("Lock camera to shot", "checkbox")?.click();
       }
-    });
+    }, true);
 
     const renderTracks = () => {
       const ruler = document.getElementById("c4d-seq-ruler");
