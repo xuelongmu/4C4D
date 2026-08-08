@@ -258,6 +258,7 @@
     document.addEventListener("keydown", (event) => {
       if (!sequencerHovered && !root.contains(document.activeElement)) return;
       if (event.target instanceof Element && event.target.matches("input, textarea, select")) return;
+      if (event.repeat) return;
       if (event.code === "Space") {
         event.preventDefault();
         event.stopPropagation();
