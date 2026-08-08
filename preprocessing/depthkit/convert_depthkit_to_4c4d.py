@@ -6,11 +6,12 @@ extracts synchronized RGB frames, undistorts them to a PINHOLE model, writes a
 fixed-camera COLMAP text model, and can initialize points3D.txt from frame-zero
 depth maps.
 
-Scatter convention assumptions used by default:
+Depthkit/Scatter convention assumptions used by default:
   * worldExtrinsics.world is a camera-to-world pose.
-  * Its camera basis is OpenGL-like: +X right, +Y up, -Z forward.
+  * Its saved rig transform is left-handed. A Z reflection is applied on both
+    the world and camera sides to produce a proper right-handed rotation.
   * Color-source extrinsics transform depth-camera coordinates to color-camera
-    coordinates in the OpenCV camera basis.
+    coordinates, so their inverse places the RGB optical center in the rig.
 
 These assumptions are written to conversion_manifest.json. Validate the result
 with --validate-only first and inspect the reported look-at score before training.
@@ -38,6 +39,8 @@ except ImportError as exc:  # pragma: no cover - exercised only in an unprepared
     ) from exc
 
 
+SCATTER_HANDEDNESS = np.diag([1.0, 1.0, -1.0, 1.0])
+# Retained for callers which explicitly request the legacy OpenGL assumption.
 OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0])
 DEPTH_PATTERN_TOKENS = ("%10T", "%5F")
 SENSOR_NUMBER_RE = re.compile(r"Sensor(\d+)-", re.IGNORECASE)
@@ -107,13 +110,17 @@ def color_camera_to_world(
     world_pose: dict[str, Any],
     color_extrinsics: dict[str, Any],
     *,
-    scatter_basis: str = "opengl",
+    scatter_basis: str = "scatter",
     color_extrinsics_direction: str = "depth-to-color",
     ignore_color_offset: bool = False,
 ) -> np.ndarray:
     """Return OpenCV-basis color camera-to-world transform."""
     world_from_depth = pose_matrix(world_pose)
-    if scatter_basis == "opengl":
+    if scatter_basis == "scatter":
+        # Scatter serializes this rig in a left-handed frame. Conjugating by a
+        # reflection changes handedness while keeping the rotation proper.
+        world_from_depth = SCATTER_HANDEDNESS @ world_from_depth @ SCATTER_HANDEDNESS
+    elif scatter_basis == "opengl":
         world_from_depth = world_from_depth @ OPENGL_TO_OPENCV
     elif scatter_basis != "opencv":
         raise ConversionError(f"Unsupported Scatter camera basis: {scatter_basis}")
@@ -121,16 +128,26 @@ def color_camera_to_world(
     if ignore_color_offset:
         return world_from_depth
 
-    color_from_depth = pose_matrix(color_extrinsics)
-    if color_extrinsics_direction == "depth-to-color":
-        depth_from_color = np.linalg.inv(color_from_depth)
-    elif color_extrinsics_direction == "color-to-depth":
-        depth_from_color = color_from_depth
-    else:
-        raise ConversionError(
-            f"Unsupported color extrinsics direction: {color_extrinsics_direction}"
-        )
+    _, depth_from_color = color_depth_transforms(
+        color_extrinsics, color_extrinsics_direction
+    )
     return world_from_depth @ depth_from_color
+
+
+def color_depth_transforms(
+    color_extrinsics: dict[str, Any], direction: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (color_from_depth, depth_from_color) for either stored convention."""
+    stored = pose_matrix(color_extrinsics)
+    if direction == "depth-to-color":
+        color_from_depth = stored
+        depth_from_color = np.linalg.inv(stored)
+    elif direction == "color-to-depth":
+        depth_from_color = stored
+        color_from_depth = np.linalg.inv(stored)
+    else:
+        raise ConversionError(f"Unsupported color extrinsics direction: {direction}")
+    return color_from_depth, depth_from_color
 
 
 def rotation_matrix_to_colmap_quaternion(rotation: np.ndarray) -> np.ndarray:
@@ -432,6 +449,7 @@ def unproject_depth_points(
     depth_index: int,
     stride: int,
     max_depth: float,
+    color_extrinsics_direction: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not camera.depth_paths or camera.depth_calibration is None:
         return np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8)
@@ -462,7 +480,9 @@ def unproject_depth_points(
         [normalized[:, 0] * z_valid, normalized[:, 1] * z_valid, z_valid]
     )
 
-    color_from_depth = pose_matrix(camera.color_calibration["extrinsics"])
+    color_from_depth, _ = color_depth_transforms(
+        camera.color_calibration["extrinsics"], color_extrinsics_direction
+    )
     homogeneous_depth = np.column_stack([depth_points, np.ones(len(depth_points))])
     color_points = (color_from_depth @ homogeneous_depth.T).T[:, :3]
     in_front = color_points[:, 2] > 1e-6
@@ -513,6 +533,7 @@ def write_initial_points(
                 depth_index=args.start_frame,
                 stride=args.depth_stride,
                 max_depth=args.max_depth,
+                color_extrinsics_direction=args.color_extrinsics_direction,
             )
             for point, rgb in zip(points, colors):
                 handle.write(
@@ -561,12 +582,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source RGB/depth frame that becomes output frame 0000",
     )
     parser.add_argument("--alpha", type=float, default=0.0, help="OpenCV undistort alpha, 0=crop, 1=retain FOV")
-    parser.add_argument("--no-points", action="store_true", help="Write an empty points3D.txt")
+    point_group = parser.add_mutually_exclusive_group()
+    point_group.add_argument(
+        "--depth-points",
+        action="store_true",
+        help="Opt in to initializing points3D.txt from depth PNGs (RGB-only is the default)",
+    )
+    point_group.add_argument(
+        "--no-points",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--depth-stride", type=int, default=4, help="Depth sampling stride for initialization")
     parser.add_argument("--max-depth", type=float, default=6.0, help="Maximum initialization depth in meters")
     parser.add_argument(
-        "--scatter-basis", choices=("opengl", "opencv"), default="opengl",
-        help="Basis used by worldExtrinsics (default inferred from this rig: opengl)",
+        "--scatter-basis", choices=("scatter", "opengl", "opencv"), default="scatter",
+        help="Basis used by worldExtrinsics (default: Scatter left-handed serialization)",
     )
     parser.add_argument(
         "--color-extrinsics-direction",
@@ -642,15 +673,18 @@ def main(argv: list[str] | None = None) -> int:
         write_colmap_images(sparse_dir / "images.txt", cameras, color_to_world)
         print(f"\nExtracting and undistorting {frame_count} frames per camera...")
         extract_frames(cameras, maps, image_dir, frame_count, args.start_frame)
-        if args.no_points:
-            (sparse_dir / "points3D.txt").write_text(
-                "# Empty initialization; generate points with MVS/MASt3R/MAtCha\n", encoding="utf-8"
-            )
-            point_count = 0
-        else:
+        if args.depth_points:
             point_count = write_initial_points(
                 sparse_dir / "points3D.txt", cameras, color_k, color_to_world, image_dir, args
             )
+            point_source = "depth"
+        else:
+            (sparse_dir / "points3D.txt").write_text(
+                "# Empty RGB-only initialization; generate points with COLMAP/MASt3R/MAtCha\n",
+                encoding="utf-8",
+            )
+            point_count = 0
+            point_source = "none"
 
         manifest = {
             "sourceProject": str(project_root),
@@ -659,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
             "sourceStartFrame": args.start_frame,
             "cameraCount": len(cameras),
             "initialPointCount": point_count,
+            "initialPointSource": point_source,
             "fps": 30,
             "poseAssumptions": {
                 "worldExtrinsicsDirection": "camera-to-world",
