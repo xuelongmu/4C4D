@@ -170,6 +170,26 @@ def interpolate_keyframes(keyframes: list[ShotKeyframe], shot_frame: float, smoo
     )
 
 
+def trim_keyframes_to_duration(
+    keyframes: list[ShotKeyframe],
+    duration_frames: int,
+    smooth: bool,
+) -> list[ShotKeyframe]:
+    """Trim a shot while preserving its evaluated pose at the new endpoint."""
+    ordered = sorted(keyframes, key=lambda key: key.shot_frame)
+    last_frame = max(int(duration_frames) - 1, 0)
+    if not ordered or ordered[-1].shot_frame <= last_frame:
+        return ordered
+    endpoint = interpolate_keyframes(ordered, last_frame, smooth)
+    endpoint = ShotKeyframe(
+        shot_frame=last_frame,
+        wxyz=np.asarray(endpoint.wxyz, dtype=np.float64).copy(),
+        position=np.asarray(endpoint.position, dtype=np.float64).copy(),
+        fov_y=float(endpoint.fov_y),
+    )
+    return [key for key in ordered if key.shot_frame < last_frame] + [endpoint]
+
+
 def scene_frame_for_shot(
     shot_frame: float,
     shot_fps: float,
@@ -1538,10 +1558,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         @shot_duration.on_update
         def _(_: Any) -> None:
             last_frame = shot_length() - 1
-            for key in keyframes:
-                key.shot_frame = min(key.shot_frame, last_frame)
-            deduplicated: dict[int, ShotKeyframe] = {key.shot_frame: key for key in keyframes}
-            keyframes[:] = sorted(deduplicated.values(), key=lambda key: key.shot_frame)
+            keyframes[:] = trim_keyframes_to_duration(
+                keyframes,
+                shot_length(),
+                str(shot_interpolation.value) == "Smooth ease",
+            )
             playhead_clipped = int(shot_frame.value) >= shot_length()
             if playhead_clipped:
                 shot_frame.value = last_frame
@@ -2000,6 +2021,19 @@ def self_test() -> None:
     ]
     midpoint = interpolate_keyframes(test_keys, 12, smooth=False)
     np.testing.assert_allclose(midpoint.position, [1.0, 0.5, 0.0])
+    trim_test_keys = [
+        ShotKeyframe(0, test_keys[0].wxyz, np.array([0.0, 0.0, 0.0]), math.radians(40.0)),
+        ShotKeyframe(100, test_keys[0].wxyz, np.array([10.0, 0.0, 0.0]), math.radians(50.0)),
+        ShotKeyframe(119, test_keys[0].wxyz, np.array([50.0, 0.0, 0.0]), math.radians(80.0)),
+    ]
+    trimmed_keys = trim_keyframes_to_duration(trim_test_keys, 101, smooth=False)
+    assert [key.shot_frame for key in trimmed_keys] == [0, 100]
+    np.testing.assert_allclose(trimmed_keys[-1].position, [10.0, 0.0, 0.0])
+    assert math.isclose(trimmed_keys[-1].fov_y, math.radians(50.0))
+    interpolated_trim = trim_keyframes_to_duration(trim_test_keys, 51, smooth=False)
+    assert [key.shot_frame for key in interpolated_trim] == [0, 50]
+    np.testing.assert_allclose(interpolated_trim[-1].position, [5.0, 0.0, 0.0])
+    assert math.isclose(interpolated_trim[-1].fov_y, math.radians(45.0))
     static_hold = interpolate_keyframes([test_keys[0]], 12, smooth=True)
     np.testing.assert_allclose(static_hold.position, test_keys[0].position)
     assert scene_frame_for_shot(12, 24, 300, (0.0, 10.0)) == 15.0
