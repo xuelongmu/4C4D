@@ -1441,6 +1441,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             keyframes[:] = [key for key in keyframes if key.shot_frame != selected_frame]
             refresh_keyframe_gui()
             refresh_camera_path()
+            apply_shot_frame(selected_frame)
             final_status.value = f"Deleted camera keyframe {selected_frame}"
 
         show_camera_path.on_update(lambda _: refresh_camera_path())
