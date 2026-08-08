@@ -1217,6 +1217,11 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 state.snapshot = capture_snapshot()
             state.dirty.set()
 
+        def commit_manual_camera_edit() -> None:
+            state.dynamic_frame_override = None
+            sync_camera_gui()
+            request_render()
+
         @client.camera.on_update
         def _(_: Any) -> None:
             if not gui_guard:
@@ -1245,12 +1250,14 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             if gui_guard:
                 return
             client.camera.position = np.asarray(camera_position.value, dtype=np.float64)
+            commit_manual_camera_edit()
 
         @camera_rotation.on_update
         def _(_: Any) -> None:
             if gui_guard:
                 return
             client.camera.wxyz = euler_xyz_degrees_to_quaternion(np.asarray(camera_rotation.value, dtype=np.float64))
+            commit_manual_camera_edit()
 
         @filmback_lens.on_update
         def _(_: Any) -> None:
@@ -1275,6 +1282,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 client.camera.fov = focal_length_to_shot_fov_y(
                     focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
                 )
+                commit_manual_camera_edit()
             refresh_keyframe_gui()
 
         @field_of_view.on_update
@@ -1296,6 +1304,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 )
             else:
                 client.camera.fov = math.radians(float(requested[0]))
+            commit_manual_camera_edit()
 
         @equivalent_focal.on_update
         def _(_: Any) -> None:
@@ -1323,6 +1332,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             client.camera.fov = focal_length_to_shot_fov_y(
                 focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
             )
+            commit_manual_camera_edit()
 
         @sensor_preset.on_update
         def _(_: Any) -> None:
@@ -1344,6 +1354,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 client.camera.fov = focal_length_to_shot_fov_y(
                     current_focal, preset[0], preset[1], current_aspect()
                 )
+                commit_manual_camera_edit()
             refresh_keyframe_gui()
 
         @toggle_playback.on_trigger
@@ -1358,7 +1369,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 client.camera.wxyz = wxyz
                 client.camera.position = position
                 client.camera.fov = reference.fov_y
-            request_render()
+            commit_manual_camera_edit()
 
         def apply_shot_frame(target_frame: float) -> None:
             nonlocal gui_guard
