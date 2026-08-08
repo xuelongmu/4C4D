@@ -1002,6 +1002,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         def current_aspect() -> float:
             return aspect_options[str(aspect_preset.value)]
 
+        def camera_follows_shot() -> bool:
+            return bool(lock_camera_to_shot.value) and state.dynamic_frame_override is not None
+
         def update_output_resolution() -> None:
             width = max(2, int(final_width.value))
             width -= width % 2
@@ -1224,14 +1227,14 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             state.dirty.set()
 
         def commit_manual_camera_edit() -> None:
-            state.dynamic_frame_override = None
+            lock_camera_to_shot.value = False
             sync_camera_gui()
             request_render()
 
         @client.camera.on_update
         def _(_: Any) -> None:
             if not gui_guard:
-                state.dynamic_frame_override = None
+                lock_camera_to_shot.value = False
                 sync_camera_gui()
             request_render()
 
@@ -1270,7 +1273,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             nonlocal gui_guard
             if gui_guard:
                 return
-            following_shot = state.dynamic_frame_override is not None
+            following_shot = camera_follows_shot()
             sensor_width_mm, sensor_height_mm, focal_mm = lens_values()
             sensor_changed = remap_keyframes_for_sensor(sensor_width_mm, sensor_height_mm)
             preset = sensor_presets[str(sensor_preset.value)]
@@ -1348,7 +1351,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             preset = sensor_presets[str(sensor_preset.value)]
             if preset is None or gui_guard:
                 return
-            following_shot = state.dynamic_frame_override is not None
+            following_shot = camera_follows_shot()
             _, _, current_focal = lens_values()
             remap_keyframes_for_sensor(preset[0], preset[1])
             gui_guard = True
@@ -1490,7 +1493,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         @aspect_preset.on_update
         def _(_: Any) -> None:
             nonlocal gui_guard, last_shot_aspect
-            following_shot = state.dynamic_frame_override is not None
+            following_shot = camera_follows_shot()
             new_aspect = current_aspect()
             sensor_width_mm, sensor_height_mm, _ = lens_values()
             current_focal = shot_fov_y_to_focal_length(
