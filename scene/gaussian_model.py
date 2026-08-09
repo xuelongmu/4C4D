@@ -581,7 +581,10 @@ class GaussianModel:
                 self._rotation_r = optimizable_tensors['rotation_r']
             self.t_gradient_accum = self.t_gradient_accum[valid_points_mask]
 
-    def opacity_decay(self, f_min=0.99, mode='net', p=2, f_max=1.0, mask=None):
+    def opacity_decay(self, f_min=0.99, mode='net', p=2, f_max=1.0, mask=None, power=1):
+        # power compounds the decay factor to keep the effective per-step decay
+        # rate consistent with the released configs, which applied decay once
+        # per batch item (factor^batch_size per optimizer step at batch_size=4).
         old_opacity = self.get_opacity
         if mode == 'const':
             curr_opacity = old_opacity * f_min
@@ -602,7 +605,10 @@ class GaussianModel:
         elif mode == 'net': # [f_min, f_max]
             if self.coefficient is None:
                 raise ValueError("Coefficient is not defined")
-            curr_opacity = old_opacity * (f_min + (f_max - f_min) * self.coefficient(old_opacity, self.get_xyzt, self.get_scaling_xyzt))
+            factor = f_min + (f_max - f_min) * self.coefficient(old_opacity, self.get_xyzt, self.get_scaling_xyzt)
+            if power != 1:
+                factor = factor ** power
+            curr_opacity = old_opacity * factor
         elif mode == 'power_desc': 
             assert p > 0, "p should be greater than 0"
             curr_opacity = old_opacity * (f_min + (f_max - f_min) * ((1 - old_opacity) ** p))

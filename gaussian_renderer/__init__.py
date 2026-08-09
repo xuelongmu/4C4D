@@ -16,7 +16,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh, eval_shfs_4d
 
-def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None, args=None, iteration=-1):
+def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None, args=None, iteration=-1, apply_decay=True):
     """
     Render the scene. 
     Background tensor (bg_color) must be on GPU!
@@ -60,8 +60,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     means2D = screenspace_points
     opacity = pc.get_opacity
     
-    # opacity decay
-    if (args is not None) and args.opacity_decay and (iteration > args.decay_from_iter):
+    # opacity decay: applied at most once per optimizer step (the caller passes
+    # apply_decay=False for all but one render in a batched iteration, since the
+    # in-place opacity update would otherwise compound batch_size times per step)
+    if (args is not None) and args.opacity_decay and apply_decay and (iteration > args.decay_from_iter):
         if args.time_aware:
             space_visibility = rasterizer.markVisible(means3D)
             time_visibility = pc.get_marginal_t(viewpoint_camera.timestamp)[:,0] > 0.05 
@@ -70,8 +72,12 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         else:
             visibility = None
         
-        # Apply opacity decay to Gaussians that are visible in current view
-        visible_opacities = pc.opacity_decay(f_min=args.f_min, f_max=args.f_max, mask=visibility)        
+        # Apply opacity decay to Gaussians that are visible in current view.
+        # The factor is compounded by batch_size so one application per step
+        # matches the expected decay of the previous once-per-batch-item
+        # behavior while being independent of batch composition and order.
+        visible_opacities = pc.opacity_decay(f_min=args.f_min, f_max=args.f_max, mask=visibility,
+                                             power=getattr(args, 'batch_size', 1))
         opacity = visible_opacities
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from

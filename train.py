@@ -135,7 +135,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gt_image = gt_image.cuda()
                 viewpoint_cam = viewpoint_cam.cuda()
                 
-                render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration)
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration,
+                                    apply_decay=(batch_idx == 0))
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                 # depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
