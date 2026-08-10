@@ -713,6 +713,7 @@ class GaussianModel:
                 means_t = torch.zeros((stds_t.size(0), 1),device="cuda")
                 samples_t = torch.normal(mean=means_t, std=stds_t)
                 new_t = samples_t + self.get_t[selected_pts_mask].repeat(N, 1)
+                new_t = torch.clamp(new_t, self.time_duration[0], self.time_duration[1])
                 new_scaling_t = self.scaling_inverse_activation(self.get_scaling_t[selected_pts_mask].repeat(N,1) / (0.8*N))
         else:
             stds = self.get_scaling_xyzt[selected_pts_mask].repeat(N,1)
@@ -721,7 +722,7 @@ class GaussianModel:
             rots = build_rotation_4d(self._rotation[selected_pts_mask], self._rotation_r[selected_pts_mask]).repeat(N,1,1)
             new_xyzt = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyzt[selected_pts_mask].repeat(N, 1)
             new_xyz = new_xyzt[...,0:3]
-            new_t = new_xyzt[...,3:4]
+            new_t = torch.clamp(new_xyzt[...,3:4], self.time_duration[0], self.time_duration[1])
             new_scaling_t = self.scaling_inverse_activation(self.get_scaling_t[selected_pts_mask].repeat(N,1) / (0.8*N))
             new_rotation_r = self._rotation_r[selected_pts_mask].repeat(N,1)
 
@@ -772,6 +773,16 @@ class GaussianModel:
             self.densify_and_split(grads, max_grad, extent, grads_t, max_grad_t)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if self.gaussian_dim == 4:
+            # A gaussian whose temporal marginal never exceeds the rasterizer's
+            # 0.05 gate inside [t0, t1] is never rendered at any training
+            # timestamp: exp(-0.5*d^2/cov_t) < 0.05  <=>  d > sqrt(2*ln 20)*sigma_t.
+            t0, t1 = self.time_duration
+            t = self.get_t.squeeze(-1)
+            sigma_t = torch.sqrt(self.get_cov_t().squeeze(-1))
+            dist_outside = torch.clamp(torch.maximum(t0 - t, t - t1), min=0.0)
+            never_rendered = dist_outside > math.sqrt(2.0 * math.log(20.0)) * sigma_t
+            prune_mask = torch.logical_or(prune_mask, never_rendered)
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
