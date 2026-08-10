@@ -446,7 +446,9 @@ if __name__ == "__main__":
         recursive_merge(k, cfg)
         
     if args.exhaust_test:
-        args.test_iterations = args.test_iterations + [i for i in range(0, op.iterations, args.test_per_iter)]
+        # args.iterations reflects the merged config; op.iterations is the
+        # OptimizationParams class default (30000) regardless of config.
+        args.test_iterations = args.test_iterations + [i for i in range(0, args.iterations, args.test_per_iter)]
         
     if args.initial_num_pts is not None:
         args.num_pts = args.initial_num_pts
