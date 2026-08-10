@@ -1,0 +1,59 @@
+# Tier-0 bug fixes: smoke gates and full A/B
+
+Date: 2026-08-10
+
+Status: all eight bug fixes merged to `agent/quality-fixes` after smoke gates;
+full 7,500-iteration A/B (pre-fix vs post-fix) running. Append the A/B results
+when complete.
+
+## Process
+
+Issues [#5](https://github.com/xuelongmu/4C4D/issues/5)–[#12](https://github.com/xuelongmu/4C4D/issues/12)
+(bugs) and [#13](https://github.com/xuelongmu/4C4D/issues/13) (sync-stall
+bundle) were each fixed on their own branch in a dedicated git worktree,
+gated by `scripts/smoke_test.sh` (700 iterations, res 4, Xuelong posefix
+scene, train cams 0,1,2,3,5,7,8,9, held out 4,6; ~2 min on one A6000), then
+merged sequentially into `agent/quality-fixes`.
+
+The smoke run exercises densification (from iter 200), the neural opacity
+decay path (from iter 500), SH degree increases, and held-out evaluation.
+Observed no-op-change spread on held-out PSNR at this scale is roughly
+±0.4 dB; smoke gates catch crashes and collapses, not sub-dB quality shifts.
+
+## Smoke results (700 iters, res 4)
+
+| Run | wall s | train PSNR | held-out PSNR | gaussians |
+|---|---:|---:|---:|---:|
+| baseline (pre-fix) | 123 | 19.15 | 18.03 | 73,358 |
+| #5 temporal densification restored | 93 | 19.17 | 18.22 | 73,907 |
+| #6 decay MLP args passthrough | 96 | 19.13 | 18.19 | 73,325 |
+| #7 once-per-step decay, power-compensated | 90 | 19.17 | 18.01 | 72,792 |
+| #7 (first attempt, uncompensated) | 89 | 19.17 | 17.69 | 77,215 |
+| #8 best-checkpoint guard | 97 | 19.17 | 17.73 | 73,228 |
+| #9 loss-plumbing fail-fast | 94 | 19.19 | 18.21 | 73,258 |
+| #10 t-clamp + temporal prune | 94 | 19.06 | 17.78 | 72,654 |
+| #11 exhaust_test from merged config | 93 | 19.14 | 18.47 | 73,106 |
+| #12 CLI toggles | 118 | 19.18 | 18.22 | 73,117 |
+| #13 sync-stall bundle | 108 | 19.06 | 17.85 | 72,960 |
+
+Notes:
+
+- The uncompensated once-per-step decay weakened the effective decay rate to
+  factor^1 instead of the released configs' factor^batch_size and raised the
+  gaussian count; the merged fix compounds the factor by batch_size, which
+  matches the expected per-step decay of the shipped batch-4 behavior.
+- Smoke wall-time differences at this scale are dominated by page-cache
+  warmth, not code changes; speed conclusions come from the full A/B.
+
+## Full A/B (7,500 iters, res 2, 8-cam split)
+
+- Control: commit `29bc344` (pre-fix code + harness), GPU 1,
+  `output_dir ab8-control`.
+- Fixed: commit `5122c2d` (fixes #5–#12; excludes #13), GPU 0,
+  `output_dir ab8-fixed`.
+- Same config (`xuelong_clip_f300_5s_rgb_posefix_7500.yaml`), seed 42,
+  `--res 2`, training view 0,1,2,3,5,7,8,9.
+- Caveat: GPU 1 carries a ~3.5 GB viewer process, so cross-GPU wall-time is
+  indicative only; quality metrics are unaffected.
+
+Results: pending.
