@@ -29,15 +29,34 @@ split (held out: 4,6) throughout. GPU 1 rows carry viewer contention
 3. Both wins are held-out-first, consistent with the project's actual
    bottleneck being sparse-view generalization.
 
+## Round 2 results
+
+| Experiment | Flags | wall | train @7500 | held-out @7500 | gaussians |
+|---|---|---|---:|---:|---:|
+| combo | budget 1M + sqrt LR + cache | **18:04** | 27.42 | 19.88 | 1,003,715 |
+| color affine (#21) | `--color_affine` | 35:38† | 23.38 (raw) | 20.06 | ~2.1M |
+
+4. **Combo: negative interaction.** 2.6x faster than the original code but
+   held-out (19.88) underperforms budget-only (20.61) and sqrt-only (20.91):
+   doubled LRs on half the capacity overshoot. Do not stack naively; the
+   production profiles below validate each pairing separately.
+5. **Color affine: not adopted for this rig.** No held-out gain (20.06 vs
+   ~20.3), and raw-render train eval drops ~4.8 dB, meaning the affines
+   learned substantial per-camera corrections that view-dependent SH was
+   evidently already absorbing. Keep the flag for rigs with worse color
+   consistency; consider chart-based static calibration at ingest instead
+   (production roadmap item).
+
 ## Running
 
-- `ab8-combo`: budget 1M + sqrt LR + cache together (interaction check;
-  GPU 0). If clean, this becomes the recommended production config
-  (~expected: sub-25 min, held-out ≥ 20.9).
-- `ab8-coloraffine`: `--color_affine` full-length A/B (GPU 1).
+- `ab8-fastprofile`: budget 1M + cache, stock LRs (GPU 0) — candidate fast
+  production profile (~expect held-out ≈ 20.6 near 21 min).
+- `ab8-qualityprofile`: sqrt LR + cache, no cap (GPU 1) — candidate quality
+  profile (~expect held-out ≈ 20.9).
 
 ## Next
 
-Full-length `--color_affine` verdict, then the implementation-heavy quality
-items: MASt3R depth supervision (#19) and static/dynamic background split
-(#20), each behind its own held-out-gated A/B.
+Write production config YAMLs from the winning profiles, then the
+implementation-heavy quality items: MASt3R depth supervision (#19) and
+static/dynamic background split (#20), each behind its own held-out-gated
+A/B.
