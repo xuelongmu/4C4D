@@ -96,6 +96,27 @@ Final gaussians 2,103,615 (control 2,158,774).
    excludes the final iteration, so the fixed run never evaluated at 7500.
    Fixed by appending `args.iterations` to `test_iterations`.
 
-**Bisect (running):** `ab8-fix5` = #5 only (GPU 0), `ab8-fix7` = #7 only
-(GPU 1), each on the pre-fix base, same config/seed/split. If neither
-reproduces the regression, #10 (or an interaction) is next.
+**Bisect round 1 (complete):** single-fix runs on the pre-fix base, same
+config/seed/split:
+
+| Run | train @7500 | held-out @6000 | held-out @7500 |
+|---|---:|---:|---:|
+| control | 26.85 | 20.98 | 20.34 |
+| #7 only (once-per-step decay) | **28.07** | **21.06** | **20.92** |
+| #5 only (temporal densification) | 27.91 | 19.54 | 20.00 |
+
+- **#7 is a genuine improvement**: +1.2 dB train, +0.6 dB held-out at final,
+  and faster (~36 min on the contended GPU). Keep.
+- **#5 is the held-out regression**: train improves while held-out drops
+  ~1.4 dB at iter 6000 — the restored temporal criterion adds overfitting
+  capacity in dynamic regions under sparse views. This matches the
+  temporally-aware-densification literature (issue #24): the raw criterion
+  needs lifespan-adaptive thresholds. Plan: revert #5 from the integration
+  branch and fold the criterion into the #24 work with tuning + a held-out
+  gate.
+- Neither run reproduces the bundle's train-side suppression, implicating
+  #10 or an interaction.
+
+**Bisect round 2 (running):** `ab8-fix10` = #10 only (GPU 0);
+`ab8-no5` = bundle through #12 with #5 reverted (GPU 1). The second run
+doubles as the candidate ship configuration.
