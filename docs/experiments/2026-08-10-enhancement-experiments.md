@@ -64,8 +64,22 @@ split (held out: 4,6) throughout. GPU 1 rows carry viewer contention
    (`ab8-fast-s43`, `ab8-sqrtlr-s43`). Full-run held-out variance should be
    treated as ~±0.4 dB, not ±0.3.
 
+## Seed-43 replication
+
+| Profile | s42 held-out | s43 held-out |
+|---|---:|---:|
+| fast (budget 1M + cache) | 20.48 | 20.39 |
+| sqrt LR + cache | 20.19 | 19.42 |
+
+8. **Fast profile confirmed**: 20.61 / 20.48 / 20.39 across three runs —
+   stable at or above the ship baseline. Production config stands.
+9. **Sqrt-LR rejected**: 20.91 / 20.19 / 19.42 — a 1.5 dB spread straddling
+   baseline. The initial +0.5 dB was sampling luck; doubled LRs add variance,
+   not quality, on this pipeline. Config keeps stock LRs.
+
 ## Next
 
-Seed-43 verdicts on the two profiles, then the implementation-heavy quality
-items: MASt3R depth supervision (#19) and static/dynamic background split
-(#20), each behind its own held-out-gated A/B.
+Implementation-heavy quality items targeting the sparse-view held-out gap:
+MASt3R depth supervision (#19) and static/dynamic background split (#20),
+each behind its own held-out-gated A/B against the production profile
+(18-minute runs make these cheap to iterate).
