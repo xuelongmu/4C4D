@@ -134,7 +134,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("\nUsing DataLoader for training dataset")
     else:
         print("\nNot using DataLoader for training dataset")
-    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, 
+    if args.gpu_cache:
+        # Decode every training image once, hold the whole set as uint8 on the
+        # GPU (1500 frames at res 2 is ~4.2 GB), and pre-move the cameras.
+        # Removes the worker pool, per-iteration PNG decode, pageable H2D
+        # copies, and the per-item Camera deepcopy from the hot loop.
+        print("\nBuilding GPU-resident image cache "
+              f"({len(training_dataset)} images)...")
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:  # cv2 decode releases the GIL
+            cached = list(pool.map(lambda i: training_dataset[i], range(len(training_dataset))))
+        cache_cameras = [cam.cuda() for _, cam in cached]
+        gpu_images = torch.stack(
+            [(img * 255.0).round().to(torch.uint8) for img, _ in cached]).cuda()
+        del cached
+        print(f"GPU image cache: {tuple(gpu_images.shape)} uint8, "
+              f"{gpu_images.numel() / 1e9:.2f} GB")
+
+        def gpu_cache_batches():
+            order = torch.randperm(len(cache_cameras)).tolist()
+            for start in range(0, len(order) - batch_size + 1, batch_size):
+                yield [(gpu_images[j], cache_cameras[j])
+                       for j in order[start:start + batch_size]]
+        training_dataloader = None
+    else:
+        training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True,
                                      num_workers=12 if dataset.dataloader else 0, collate_fn=lambda x: x, drop_last=True)
     
     img_dir = os.path.join(scene.model_path, "rendered_images")
@@ -142,7 +166,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     iteration = first_iter
     while iteration < opt.iterations + 1:
-        for batch_data in training_dataloader:
+        for batch_data in (gpu_cache_batches() if args.gpu_cache else training_dataloader):
             iteration += 1
             if iteration > opt.iterations:
                 break
@@ -165,8 +189,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             for batch_idx in range(batch_size):
                 gt_image, viewpoint_cam = batch_data[batch_idx]
-                gt_image = gt_image.cuda()
-                viewpoint_cam = viewpoint_cam.cuda()
+                if args.gpu_cache:
+                    gt_image = gt_image.to(torch.float32).div_(255.0)
+                else:
+                    gt_image = gt_image.cuda()
+                    viewpoint_cam = viewpoint_cam.cuda()
                 
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration,
                                     apply_decay=(batch_idx == 0))
@@ -474,6 +501,8 @@ if __name__ == "__main__":
                         help='learn a per-training-camera 3x4 color affine applied to the training loss')
     parser.add_argument('--color_affine_lr', type=float, default=1e-4)
     parser.add_argument('--color_affine_weight_decay', type=float, default=1e-2)
+    parser.add_argument('--gpu_cache', action=BooleanOptionalAction, default=False,
+                        help='decode all training images once and keep them as uint8 on the GPU')
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
