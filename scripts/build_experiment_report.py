@@ -41,6 +41,8 @@ RUNS = [
     ("ab8-qualityprofile", "Candidate: sqrtLR+cache",             "5. Profiles",     "did not replicate sqrt gain", ""),
     ("ab8-fast-s43",       "Production profile, seed 43",         "6. Replication",  "confirms stability (20.39)", ""),
     ("ab8-sqrtlr-s43",     "sqrtLR+cache, seed 43",               "6. Replication",  "19.42 — confirms sqrt-LR rejection", ""),
+    ("ab8-staticfreeze",   "Static-temporal freeze",              "7. Static split", "WIN: +0.73 held-out vs control — adopted", "20"),
+    ("ab8-staticfreeze-s43", "Static-temporal freeze, seed 43",   "7. Static split", "WIN replicated: +0.56 held-out", "20"),
 ]
 
 PROBE = "cam06_0036"
