@@ -117,6 +117,26 @@ config/seed/split:
 - Neither run reproduces the bundle's train-side suppression, implicating
   #10 or an interaction.
 
-**Bisect round 2 (running):** `ab8-fix10` = #10 only (GPU 0);
-`ab8-no5` = bundle through #12 with #5 reverted (GPU 1). The second run
-doubles as the candidate ship configuration.
+**Bisect round 2 (complete):**
+
+| Run | train @7500 | held-out @7500 |
+|---|---:|---:|
+| control | 26.85 | 20.34 |
+| #10 only | 26.00 | **18.56** |
+| bundle minus #5 (still incl. #10) | 26.81 @7000 | 19.04 @7000 |
+
+**#10 is the primary regression** — −1.8 dB held-out and −0.85 dB train on
+its own. Likely mechanism: `t` drifts during optimization, and irreversibly
+pruning at exactly the rasterizer's 0.05 marginal gate creates prune-refill
+churn that wastes capacity. #5's held-out cost stacks on top of it.
+
+**Resolution:** reverted both #5 (`9e5e9ab`) and #10 (`4db5184`) from
+`agent/quality-fixes`. The ship set is #6, #7, #8, #9, #11, #12 plus the
+speed enhancements; #7 is a confirmed quality win (+0.6 dB held-out). #5's
+criterion moves to the #24 design (lifespan-adaptive thresholds); #10 needs a
+margin-based or final-pass prune design, tracked on the issue.
+
+**Ship validation (running):** `ab8-ship` (vanilla, GPU 0) and
+`ab8-shipcache` (`--gpu_cache`, GPU 1) from the reverted tip. Expected:
+held-out ≈ #7-only (~20.9), matching quality between the pair, and the
+wall-time delta isolates the GPU cache win.
