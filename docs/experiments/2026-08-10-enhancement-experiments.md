@@ -83,3 +83,21 @@ Implementation-heavy quality items targeting the sparse-view held-out gap:
 MASt3R depth supervision (#19) and static/dynamic background split (#20),
 each behind its own held-out-gated A/B against the production profile
 (18-minute runs make these cheap to iterate).
+
+## Static-freeze (#20-lite), 2026-08-11
+
+Freeze temporal parameters of gaussians whose marginal exceeds the render
+gate at both clip endpoints (`--freeze_static_temporal`), vs the production
+profile, both seeds:
+
+| Seed | control held-out | static-freeze held-out | train | wall |
+|---:|---:|---:|---:|---|
+| 42 | 20.48 | **21.21** | 27.36 | 18:52 |
+| 43 | 20.39 | **20.95** | 27.69 | ~19 min |
+
++0.6-0.7 dB held-out on both seeds with train up ~+1 dB at unchanged wall
+time — the first enhancement-track quality win beyond noise. Final static
+fraction is only ~2.5%, so the gain likely comes from stabilizing background
+geometry early. **Adopted into the production config.** The full #20 design
+(3D-SH background subset, pretrained background) remains open with a higher
+ceiling.

@@ -17,6 +17,7 @@ force_sh_3d: false
 batch_size: 4
 exhaust_test: true
 gpu_cache: true
+freeze_static_temporal: true
 
 ModelParams:
   sh_degree: 3
