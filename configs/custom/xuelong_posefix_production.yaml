@@ -1,0 +1,72 @@
+# Production profile for the Xuelong posefix scene, validated 2026-08-10/11
+# (docs/experiments/2026-08-10-enhancement-experiments.md):
+#   - 1M gaussian budget: held-out PSNR parity with the 2M baseline
+#     (+0.1..0.2 dB), half the model size (#18)
+#   - GPU-resident image cache: quality-inert, large wall-time win (#15)
+#   - once-per-step opacity decay (#7) and Tier-0 fixes are in the code
+# Measured: 18:29 wall for 7500 iters at res 2 on one A6000 (vs ~47 min
+# pre-fix), held-out 20.48-20.61 dB on the 8-camera split.
+# Deliberately NOT included: sqrt-batch LR scaling (#16) pending multi-seed
+# confirmation; --color_affine (no gain on this rig, #21).
+gaussian_dim: 4
+time_duration: [0.0, 5.0]
+num_pts: 75000
+num_pts_ratio: 1.0
+rot_4d: true
+force_sh_3d: false
+batch_size: 4
+exhaust_test: true
+gpu_cache: true
+
+ModelParams:
+  sh_degree: 3
+  source_path: "/home/zerospace/4C4D/data/Xuelong/clip_f300_5s_rgb_posefix"
+  model_path: "/home/zerospace/4C4D/output/Xuelong/clip_f300_5s_rgb_posefix_production"
+  images: "images"
+  resolution: 2
+  white_background: false
+  data_device: "cuda"
+  eval: true
+  extension: ".png"
+  num_extra_pts: 0
+  loaded_pth: ""
+  frame_ratio: 1
+  dataloader: true
+
+PipelineParams:
+  convert_SHs_python: false
+  compute_cov3D_python: false
+  debug: false
+  env_map_res: 0
+  env_optimize_until: 1000000000
+  env_optimize_from: 0
+  eval_shfs_4d: true
+
+OptimizationParams:
+  iterations: 7500
+  position_lr_init: 0.00016
+  position_t_lr_init: -1.0
+  position_lr_final: 0.0000016
+  position_lr_delay_mult: 0.01
+  position_lr_max_steps: 7500
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  coefficient_lr: 0.00001
+  coefficient_weight_decay: 0.0001
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  percent_dense: 0.01
+  lambda_dssim: 0.2
+  thresh_opa_prune: 0.005
+  densification_interval: 100
+  opacity_reset_interval: 3000
+  densify_from_iter: 500
+  densify_until_iter: 3500
+  densify_grad_threshold: 0.0002
+  densify_grad_t_threshold: 0.000005
+  densify_until_num_points: 1000000
+  final_prune_from_iter: -1
+  sh_increase_interval: 1000
+  lambda_opa_mask: 0.0
+  lambda_rigid: 0.0
+  lambda_motion: 0.0

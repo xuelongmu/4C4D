@@ -47,16 +47,25 @@ split (held out: 4,6) throughout. GPU 1 rows carry viewer contention
    consistency; consider chart-based static calibration at ingest instead
    (production roadmap item).
 
-## Running
+## Profile validation
 
-- `ab8-fastprofile`: budget 1M + cache, stock LRs (GPU 0) — candidate fast
-  production profile (~expect held-out ≈ 20.6 near 21 min).
-- `ab8-qualityprofile`: sqrt LR + cache, no cap (GPU 1) — candidate quality
-  profile (~expect held-out ≈ 20.9).
+| Profile | Flags | wall | train @7500 | held-out @7500 |
+|---|---|---|---:|---:|
+| fast | budget 1M + cache | **18:29** | 26.52 | 20.48 |
+| quality | sqrt LR + cache | 27:31† | 26.83 | 20.19 |
+
+6. **Fast profile adopted as production default**
+   (`configs/custom/xuelong_posefix_production.yaml`): three runs at the 1M
+   budget landed at 20.61/20.48 held-out vs ship 20.39 — parity or better,
+   2.6x faster than the pre-fix code, half the model size.
+7. **Sqrt-LR gain not replicated with the cache** (20.19 vs the 20.91
+   sqrt-only run) — the effect is inside run-to-run variance until a
+   multi-seed pass says otherwise. Seed-43 replication pair running
+   (`ab8-fast-s43`, `ab8-sqrtlr-s43`). Full-run held-out variance should be
+   treated as ~±0.4 dB, not ±0.3.
 
 ## Next
 
-Write production config YAMLs from the winning profiles, then the
-implementation-heavy quality items: MASt3R depth supervision (#19) and
-static/dynamic background split (#20), each behind its own held-out-gated
-A/B.
+Seed-43 verdicts on the two profiles, then the implementation-heavy quality
+items: MASt3R depth supervision (#19) and static/dynamic background split
+(#20), each behind its own held-out-gated A/B.
