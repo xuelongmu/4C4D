@@ -317,6 +317,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         dataset.white_background and iteration == opt.densify_from_iter)) and args.reset_opacity:
                         gaussians.reset_opacity()
                         
+                # Static/dynamic split (lite): gaussians whose temporal marginal
+                # exceeds the render gate at both clip endpoints cover the whole
+                # clip and are effectively static. Zeroing their temporal
+                # gradients stops background gaussians from churning in time,
+                # reserving temporal capacity for the performer.
+                if (args.freeze_static_temporal and gaussians.gaussian_dim == 4
+                        and iteration > opt.densify_from_iter):
+                    sm = gaussians.static_mask
+                    if (iteration % 100 == 0 or sm is None
+                            or sm.shape[0] != gaussians._t.shape[0]):
+                        t0, t1 = gaussians.time_duration
+                        cov_t = gaussians.get_cov_t()
+                        t = gaussians.get_t
+                        m0 = torch.exp(-0.5 * (t - t0) ** 2 / cov_t)[:, 0] > 0.05
+                        m1 = torch.exp(-0.5 * (t - t1) ** 2 / cov_t)[:, 0] > 0.05
+                        sm = gaussians.static_mask = m0 & m1
+                        if iteration % 500 == 0:
+                            print(f"\n[ITER {iteration}] static fraction: "
+                                  f"{sm.float().mean().item():.3f}")
+                    params_t = [gaussians._t, gaussians._scaling_t]
+                    if gaussians.rot_4d:
+                        params_t.append(gaussians._rotation_r)
+                    for p in params_t:
+                        if p.grad is not None:
+                            p.grad[sm] = 0.0
+
                 # Optimizer step
                 if iteration < opt.iterations:
                     gaussians.optimizer.step()
@@ -503,6 +529,8 @@ if __name__ == "__main__":
     parser.add_argument('--color_affine_weight_decay', type=float, default=1e-2)
     parser.add_argument('--gpu_cache', action=BooleanOptionalAction, default=False,
                         help='decode all training images once and keep them as uint8 on the GPU')
+    parser.add_argument('--freeze_static_temporal', action=BooleanOptionalAction, default=False,
+                        help='zero temporal gradients of gaussians whose support spans the whole clip')
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
