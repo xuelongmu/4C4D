@@ -91,6 +91,9 @@ class GaussianModel:
         
         self.active_sh_degree_t = 0
         self.max_sh_degree_t = sh_degree_t
+        # Boolean [N] mask of gaussians whose temporal support spans the whole
+        # clip; maintained by train.py when --freeze_static_temporal is on.
+        self.static_mask = None
         
         self.coefficient = coefficient
         self.setup_functions()
