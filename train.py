@@ -23,7 +23,7 @@ from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, BooleanOptionalAction, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import numpy as np
 from omegaconf import OmegaConf
@@ -412,7 +412,7 @@ if __name__ == "__main__":
                             e.g. '0,1,2'. If not specified, all cameras will be used.")
     
     # opacity decay
-    parser.add_argument("--opacity_decay", action="store_true", default=True)
+    parser.add_argument("--opacity_decay", action=BooleanOptionalAction, default=True)
     parser.add_argument('--f_max', default=0.998, type=float, help='max factor')
     parser.add_argument("--f_min", type=float, default=0.996, help='min factor')
     
@@ -427,7 +427,7 @@ if __name__ == "__main__":
     
     parser.add_argument('--test_per_iter', default=1500, type=int)
     
-    parser.add_argument('--time_aware', action="store_true", default=True)
+    parser.add_argument('--time_aware', action=BooleanOptionalAction, default=True)
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
