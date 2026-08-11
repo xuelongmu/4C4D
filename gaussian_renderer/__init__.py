@@ -65,10 +65,13 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     # in-place opacity update would otherwise compound batch_size times per step)
     if (args is not None) and args.opacity_decay and apply_decay and (iteration > args.decay_from_iter):
         if args.time_aware:
-            space_visibility = rasterizer.markVisible(means3D)
-            time_visibility = pc.get_marginal_t(viewpoint_camera.timestamp)[:,0] > 0.05 
-            visibility = space_visibility & time_visibility
-            visibility = visibility.view(-1, 1)
+            # The mask is a boolean; building the 4D covariance chain
+            # (three batched Nx4x4 GEMMs) with autograd just to threshold
+            # marginal_t wastes both compute and ~1 GB of graph transients.
+            with torch.no_grad():
+                space_visibility = rasterizer.markVisible(means3D)
+                time_visibility = pc.get_marginal_t(viewpoint_camera.timestamp)[:,0] > 0.05
+                visibility = (space_visibility & time_visibility).view(-1, 1)
         else:
             visibility = None
         
