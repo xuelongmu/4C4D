@@ -136,7 +136,23 @@ speed enhancements; #7 is a confirmed quality win (+0.6 dB held-out). #5's
 criterion moves to the #24 design (lifespan-adaptive thresholds); #10 needs a
 margin-based or final-pass prune design, tracked on the issue.
 
-**Ship validation (running):** `ab8-ship` (vanilla, GPU 0) and
-`ab8-shipcache` (`--gpu_cache`, GPU 1) from the reverted tip. Expected:
-held-out ≈ #7-only (~20.9), matching quality between the pair, and the
-wall-time delta isolates the GPU cache win.
+**Ship validation (complete):** from the reverted tip:
+
+| Run | wall | train @7500 | held-out @7500 |
+|---|---|---:|---:|
+| control (pre-fix) | ~47 min (contended GPU) | 26.85 | 20.34 |
+| `ab8-ship` (vanilla, GPU 0) | 32:43 | 28.15 | 20.39 |
+| `ab8-shipcache` (`--gpu_cache`, contended GPU 1) | **27:02** | 28.03 | 20.23 |
+
+Conclusions: the shipped bundle matches control on held-out views, gains
++1.3 dB on train views (mostly from #7), and cuts wall time ~30% — ~42%
+with the GPU cache, whose 5:41 saving was measured on the *contended* GPU
+and is therefore an underestimate. Cache quality is identical within noise,
+as designed. The #7-only bisect run measured 20.92 held-out; the ship tip
+measured 20.39–20.23, so treat ~±0.3 dB as full-run variance pending a
+multi-seed pass.
+
+Next experiments (one variable each, vs `ab8-ship`): budget cap
+(`--max_num_pts 1000000`), sqrt-batch LR scaling, full-length
+`--color_affine`, then the depth-supervision and static/dynamic-split
+implementations.
