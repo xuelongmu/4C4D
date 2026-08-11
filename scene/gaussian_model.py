@@ -689,10 +689,6 @@ class GaussianModel:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        if self.gaussian_dim == 4 and grads_t is not None and grad_t_threshold is not None:
-            padded_grad_t = torch.zeros((n_init_points), device="cuda")
-            padded_grad_t[:grads_t.shape[0]] = grads_t.squeeze()
-            selected_pts_mask = torch.logical_or(selected_pts_mask, padded_grad_t >= grad_t_threshold)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
         
@@ -737,9 +733,6 @@ class GaussianModel:
     def densify_and_clone(self, grads, grad_threshold, scene_extent, grads_t, grad_t_threshold):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        if self.gaussian_dim == 4 and grads_t is not None and grad_t_threshold is not None:
-            selected_pts_mask = torch.logical_or(selected_pts_mask,
-                                                 torch.norm(grads_t, dim=-1) >= grad_t_threshold)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
