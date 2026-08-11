@@ -108,6 +108,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
     gaussians.env_map = env_map
     training_dataset = scene.getTrainCameras()
+
+    # Per-camera learnable color affine (3x4: linear color mix + offset),
+    # parameterized as a delta from identity. Multi-camera rigs have per-ISP
+    # color mismatch that otherwise gets absorbed into view-dependent SH.
+    # Applied to the rendered image only when computing the training loss;
+    # evaluation and held-out cameras always use the raw render. The first
+    # training camera is anchored to identity and the rest are weight-decayed
+    # toward it, otherwise the affines form a global color gauge the model
+    # drifts into (raw renders and held-out cameras then mismatch).
+    color_affine_delta = None
+    color_affine_optimizer = None
+    color_affine_index = {}
+    if args.color_affine:
+        if args.training_view:
+            cam_names = list(args.training_view)
+        else:
+            cam_names = sorted({c.image_name.split('_')[0] for c in training_dataset.viewpoint_stack})
+        color_affine_index = {name: i for i, name in enumerate(cam_names)}
+        color_affine_delta = nn.Parameter(torch.zeros(len(cam_names), 3, 4, device="cuda"))
+        color_affine_optimizer = torch.optim.AdamW(
+            [color_affine_delta], lr=args.color_affine_lr, weight_decay=args.color_affine_weight_decay)
+        color_affine_eye = torch.eye(3, 4, device="cuda")
     if dataset.dataloader:
         print("\nUsing DataLoader for training dataset")
     else:
@@ -151,9 +173,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                 # depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
-                # Loss
-                Ll1 = l1_loss(image, gt_image)
-                Lssim = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                # Loss (per-camera color affine applies only to the training loss;
+                # eval and held-out renders stay raw; camera 0 is the anchor)
+                affine_idx = color_affine_index.get(viewpoint_cam.image_name.split('_')[0], 0) \
+                    if color_affine_delta is not None else 0
+                if color_affine_delta is not None and affine_idx != 0:
+                    affine = color_affine_eye + color_affine_delta[affine_idx]
+                    image_for_loss = torch.einsum('dc,chw->dhw', affine[:, :3], image) + affine[:, 3][:, None, None]
+                else:
+                    image_for_loss = image
+                Ll1 = l1_loss(image_for_loss, gt_image)
+                Lssim = 1.0 - fast_ssim(image_for_loss.unsqueeze(0), gt_image.unsqueeze(0))
                 loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim
                     
                 loss = loss / batch_size
@@ -268,6 +298,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if gaussians.coefficient is not None:
                         gaussians.coef_optimizer.step()
                         gaussians.coef_optimizer.zero_grad(set_to_none = True)
+
+                    if color_affine_optimizer is not None:
+                        color_affine_optimizer.step()
+                        color_affine_optimizer.zero_grad(set_to_none = True)
                         
                     if pipe.env_map_res and iteration < pipe.env_optimize_until:
                         env_map_optimizer.step()
@@ -286,6 +320,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
+                    if color_affine_delta is not None:
+                        torch.save({'index': color_affine_index,
+                                    'affine_delta': color_affine_delta.detach().cpu()},
+                                   os.path.join(scene.model_path, f"color_affine_{iteration}.pth"))
         
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -432,6 +470,10 @@ if __name__ == "__main__":
     parser.add_argument('--test_per_iter', default=1500, type=int)
     
     parser.add_argument('--time_aware', action=BooleanOptionalAction, default=True)
+    parser.add_argument('--color_affine', action=BooleanOptionalAction, default=False,
+                        help='learn a per-training-camera 3x4 color affine applied to the training loss')
+    parser.add_argument('--color_affine_lr', type=float, default=1e-4)
+    parser.add_argument('--color_affine_weight_decay', type=float, default=1e-2)
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     

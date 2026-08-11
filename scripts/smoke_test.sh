@@ -6,12 +6,13 @@
 # opacity decay path (from iter 500), SH degree increases, and held-out
 # evaluation. Prints a one-line metrics summary parsed from the log.
 #
-# Usage: scripts/smoke_test.sh <run_name> [gpu_index]
+# Usage: scripts/smoke_test.sh <run_name> [gpu_index] [extra train.py args...]
 # Run from the repo (or worktree) root whose code should be tested.
 set -euo pipefail
 
-RUN_NAME=${1:?usage: smoke_test.sh <run_name> [gpu]}
+RUN_NAME=${1:?usage: smoke_test.sh <run_name> [gpu] [extra args...]}
 GPU=${2:-0}
+EXTRA=("${@:3}")
 STAMP=$(date +%H%M%S)
 OUT_DIR="${RUN_NAME}-${STAMP}"
 LOG="/tmp/smoke_${RUN_NAME}_${STAMP}.log"
@@ -25,6 +26,7 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PY" -u train.py \
   --res 4 \
   --training_view 0,1,2,3,5,7,8,9 \
   --test_iterations 700 \
+  ${EXTRA[@]+"${EXTRA[@]}"} \
   > "$LOG" 2>&1 || { echo "SMOKE FAILED (exit $?) — tail of $LOG:"; tail -20 "$LOG"; exit 1; }
 END=$(date +%s)
 
