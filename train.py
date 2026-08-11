@@ -523,7 +523,9 @@ if __name__ == "__main__":
     if args.exhaust_test:
         # args.iterations reflects the merged config; op.iterations is the
         # OptimizationParams class default (30000) regardless of config.
-        args.test_iterations = args.test_iterations + [i for i in range(0, args.iterations, args.test_per_iter)]
+        # Always include the final iteration: range() excludes its stop, which
+        # silently dropped the end-of-training evaluation.
+        args.test_iterations = args.test_iterations + [i for i in range(0, args.iterations, args.test_per_iter)] + [args.iterations]
         
     if args.initial_num_pts is not None:
         args.num_pts = args.initial_num_pts

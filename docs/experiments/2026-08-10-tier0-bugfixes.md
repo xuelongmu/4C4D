@@ -56,4 +56,46 @@ Notes:
 - Caveat: GPU 1 carries a ~3.5 GB viewer process, so cross-GPU wall-time is
   indicative only; quality metrics are unaffected.
 
-Results: pending.
+Control results (complete, ~47 min wall on GPU 1):
+
+| Iter | train PSNR | held-out PSNR |
+|---:|---:|---:|
+| 4500 | 26.43 | 20.94 |
+| 6000 | 27.22 | **20.98** |
+| 7000 | 27.65 | 20.11 |
+| 7500 | 26.85 | 20.34 |
+
+Final gaussian count 2,158,774. Held-out PSNR peaks near iter 6000 and
+declines afterward — late-run overfitting after the densification cap; the
+best checkpoint (20.98) is what chkpnt_best.pth captured. Reproduces the
+2026-08-08 ablation8 result (20.26 final) within run-to-run variance.
+
+Fixed-side results (complete, **32:54 wall** on GPU 0 vs ~47 min control):
+
+| Iter | control train / test | fixed train / test |
+|---:|---|---|
+| 4500 | 26.43 / 20.94 | 26.02 / 18.99 |
+| 6000 | 27.22 / **20.98** | 26.59 / 19.08 |
+| 7000 | 27.65 / 20.11 | 26.34 / 19.27 |
+| 7500 | 26.85 / 20.34 | (not evaluated — see below) |
+
+Final gaussians 2,103,615 (control 2,158,774).
+
+**Findings:**
+
+1. **Speed: ~30% faster** (32:54 vs ~47 min; control ran on the GPU with a
+   ~3.5 GB viewer process, so treat the exact ratio as indicative).
+2. **Quality regression: −1.3 dB train, −1.9 dB held-out at iter 6000.**
+   Both populations degrade, so this is suppressed fitting, not just
+   overfitting. The ±0.4 dB smoke gate could not see it. Candidate causes are
+   the three quality-affecting fixes: #5 (temporal densification OR), #7
+   (once-per-step decay, power-compensated — lumpier decay, higher variance),
+   #10 (t-clamp + temporal prune). Densification counts in the logs do not
+   show a clone explosion from #5.
+3. **#11 follow-up bug:** the corrected `range(0, iterations, test_per_iter)`
+   excludes the final iteration, so the fixed run never evaluated at 7500.
+   Fixed by appending `args.iterations` to `test_iterations`.
+
+**Bisect (running):** `ab8-fix5` = #5 only (GPU 0), `ab8-fix7` = #7 only
+(GPU 1), each on the pre-fix base, same config/seed/split. If neither
+reproduces the regression, #10 (or an interaction) is next.
