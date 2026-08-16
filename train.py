@@ -16,7 +16,7 @@ import random
 import torch
 from torch import nn
 from utils.loss_utils import l1_loss #, ssim, msssim
-from gaussian_renderer import render
+from gaussian_renderer import render, decay_visibility
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -48,9 +48,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
 
+    # The regularizer losses behind lambda_opa_mask/lambda_rigid/lambda_motion
+    # are not implemented; the previous vars()-based EMA plumbing silently did
+    # nothing and would raise KeyError if a lambda were nonzero. Fail fast
+    # instead of training something other than what the config claims, and do
+    # it before the logger, model, and scene are built so an invalid config
+    # does not pay the dataset load and CUDA allocations first.
+    unimplemented_lambdas = [key for key in opt.__dict__.keys()
+                             if key.startswith('lambda') and key != 'lambda_dssim'
+                             and opt.__dict__[key] != 0]
+    if unimplemented_lambdas:
+        raise NotImplementedError(
+            f"Losses for {unimplemented_lambdas} are not implemented; set them to 0 "
+            "or implement the corresponding regularizers.")
+
     if dataset.frame_ratio > 1:
         time_duration = [time_duration[0] / dataset.frame_ratio,  time_duration[1] / dataset.frame_ratio]
-    
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     
@@ -84,18 +98,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_l1loss_for_log = 0.0
     ema_ssimloss_for_log = 0.0
-    # The regularizer losses behind lambda_opa_mask/lambda_rigid/lambda_motion
-    # are not implemented; the previous vars()-based EMA plumbing silently did
-    # nothing and would raise KeyError if a lambda were nonzero. Fail fast
-    # instead of training something other than what the config claims.
-    unimplemented_lambdas = [key for key in opt.__dict__.keys()
-                             if key.startswith('lambda') and key != 'lambda_dssim'
-                             and opt.__dict__[key] > 0]
-    if unimplemented_lambdas:
-        raise NotImplementedError(
-            f"Losses for {unimplemented_lambdas} are not implemented; set them to 0 "
-            "or implement the corresponding regularizers.")
-    
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training", ncols=110)
     first_iter += 1
         
@@ -162,14 +165,49 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             batch_point_grad = []
             batch_visibility_filter = []
             batch_radii = []
-            
+
+            batch_cams = [batch_data[i][1].cuda() for i in range(batch_size)]
+
+            # Opacity decay, applied exactly once per optimizer step rather than
+            # once per batch item. Each gaussian's decay exponent is the number
+            # of the step's viewpoints that can see it, so the result does not
+            # depend on which camera happens to come first in the shuffled
+            # batch.
+            #
+            # Every render in the step shares the decayed opacity, but each one
+            # backpropagates separately, so the shared tensor is handed to them
+            # as a detached leaf: the per-item backward passes accumulate into
+            # its .grad instead of trying to walk (and free) the one decay
+            # subgraph four times. That subgraph is backpropagated once after
+            # the loop, which is also what carries the render gradients back to
+            # _opacity and the coefficient network.
+            decayed_opacity = None
+            shared_opacity = None
+            if args.opacity_decay and iteration > args.decay_from_iter:
+                if args.time_aware:
+                    visibility_counts = torch.zeros(gaussians.get_xyz.shape[0], 1, device="cuda")
+                    # The temporal covariance is the expensive part of the
+                    # visibility test (build_scaling_rotation_4d plus two
+                    # batched Nx4x4 GEMMs) and is the same for every viewpoint
+                    # in the step, so build it once instead of per camera.
+                    with torch.no_grad():
+                        cov_t = gaussians.get_cov_t()
+                    for cam in batch_cams:
+                        visibility_counts += decay_visibility(
+                            cam, gaussians, pipe, background, cov_t=cov_t).view(-1, 1).float()
+                else:
+                    visibility_counts = batch_size
+                decayed_opacity = gaussians.opacity_decay(
+                    f_min=args.f_min, f_max=args.f_max, power=visibility_counts)
+                shared_opacity = decayed_opacity.detach().requires_grad_(True)
+
             for batch_idx in range(batch_size):
-                gt_image, viewpoint_cam = batch_data[batch_idx]
+                gt_image, _ = batch_data[batch_idx]
+                viewpoint_cam = batch_cams[batch_idx]
                 gt_image = gt_image.cuda()
-                viewpoint_cam = viewpoint_cam.cuda()
-                
+
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration,
-                                    apply_decay=(batch_idx == 0))
+                                    decayed_opacity=shared_opacity)
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                 # depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
@@ -192,7 +230,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 batch_point_grad.append(torch.norm(viewspace_point_tensor.grad[:,:2], dim=-1))
                 batch_radii.append(radii)
                 batch_visibility_filter.append(visibility_filter)
-                
+
+            # Chain the batch's accumulated opacity gradient through the decay
+            # subgraph exactly once, reaching _opacity and the coefficient.
+            if shared_opacity is not None and shared_opacity.grad is not None:
+                decayed_opacity.backward(shared_opacity.grad)
+
             if (iteration % 1500 == 0 or iteration == 2):  # Save every 100 iterations
                 # Convert rendered image tensor to numpy and save
                 image = torch.clamp(image, 0.0, 1.0)
@@ -478,8 +521,22 @@ if __name__ == "__main__":
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
     args = parser.parse_args(sys.argv[1:])
+
+    # Which options were actually typed on the command line. argparse only
+    # fills in a default for a dest that is not already present on the
+    # namespace, so parsing a second time into a namespace pre-seeded with
+    # sentinels leaves every option the command line did not set as the
+    # sentinel. The YAML merge below assigns every configured leaf onto args,
+    # which would otherwise silently discard an explicit flag: with
+    # opacity_decay or time_aware present in the config, --no-opacity_decay
+    # and --no-time_aware had no effect at all.
+    _unset = object()
+    cli_probe = Namespace(**{a.dest: _unset for a in parser._actions if a.dest != "help"})
+    parser.parse_args(sys.argv[1:], namespace=cli_probe)
+    cli_explicit = {dest for dest, value in vars(cli_probe).items() if value is not _unset}
+
     args.save_iterations.append(args.iterations)
-        
+
     cfg = OmegaConf.load(args.config)
     def recursive_merge(key, host):
         if isinstance(host[key], DictConfig):
@@ -487,6 +544,8 @@ if __name__ == "__main__":
                 recursive_merge(key1, host[key])
         else:
             assert hasattr(args, key), key
+            if key in cli_explicit:
+                return  # an explicit command-line value outranks the config
             setattr(args, key, host[key])
     for k in cfg.keys():
         recursive_merge(k, cfg)
