@@ -12,20 +12,46 @@ import convert_depthkit_to_4c4d as converter
 
 
 class TransformTests(unittest.TestCase):
-    def test_identity_scatter_opengl_points_opencv_forward_inward(self):
+    def test_scatter_handedness_conversion_is_a_proper_rotation(self):
         pose = {"rotation": [0, 0, 0], "translation": [1, 2, 3]}
         extrinsics = {"rotation": [0, 0, 0], "translation": [0, 0, 0]}
         result = converter.color_camera_to_world(pose, extrinsics)
-        np.testing.assert_allclose(result[:3, :3], converter.OPENGL_TO_OPENCV[:3, :3])
-        np.testing.assert_allclose(result[:3, 3], [1, 2, 3])
+        np.testing.assert_allclose(result[:3, :3], np.eye(3))
+        np.testing.assert_allclose(result[:3, 3], [1, 2, -3])
+        self.assertAlmostEqual(np.linalg.det(result[:3, :3]), 1.0)
 
-    def test_depth_to_color_extrinsics_are_inverted_for_color_pose(self):
+    def test_color_to_depth_extrinsics_are_used_for_color_pose(self):
         pose = {"rotation": [0, 0, 0], "translation": [0, 0, 0]}
         extrinsics = {"rotation": [0, 0, 0], "translation": [-0.03, 0, 0]}
         result = converter.color_camera_to_world(
-            pose, extrinsics, scatter_basis="opencv"
+            pose, extrinsics, scatter_basis="opencv",
+            color_extrinsics_direction="color-to-depth",
         )
-        np.testing.assert_allclose(result[:3, 3], [0.03, 0, 0], atol=1e-12)
+        np.testing.assert_allclose(result[:3, 3], [-0.03, 0, 0], atol=1e-12)
+
+    def test_color_depth_transforms_respect_stored_direction(self):
+        extrinsics = {
+            "rotation": [0.01, -0.02, 0.03],
+            "translation": [-0.03, 0.004, 0.002],
+        }
+        stored = converter.pose_matrix(extrinsics)
+        color_from_depth, depth_from_color = converter.color_depth_transforms(
+            extrinsics, "color-to-depth"
+        )
+        np.testing.assert_allclose(depth_from_color, stored, atol=1e-12)
+        np.testing.assert_allclose(color_from_depth @ depth_from_color, np.eye(4), atol=1e-12)
+
+        color_from_depth, depth_from_color = converter.color_depth_transforms(
+            extrinsics, "depth-to-color"
+        )
+        np.testing.assert_allclose(color_from_depth, stored, atol=1e-12)
+        np.testing.assert_allclose(depth_from_color @ color_from_depth, np.eye(4), atol=1e-12)
+
+    def test_rgb_only_is_default(self):
+        args = converter.build_parser().parse_args(["project", "take", "output"])
+        self.assertFalse(args.depth_points)
+        self.assertEqual(args.scatter_basis, "scatter")
+        self.assertEqual(args.color_extrinsics_direction, "depth-to-color")
 
     def test_colmap_quaternion_round_trip(self):
         rotation = cv2.Rodrigues(np.array([0.2, -0.4, 0.1]))[0]
