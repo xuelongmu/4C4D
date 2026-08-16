@@ -72,3 +72,78 @@ def msssim(rgb, gts):
     # assert (rgb.max() <= 1.05 and rgb.min() >= -0.05)
     # assert (gts.max() <= 1.05 and gts.min() >= -0.05)
     return ms_ssim(rgb, gts).item()
+
+
+def _to_patches(t, patch_size):
+    """(H, W) -> (num_patches, patch_size * patch_size), non-overlapping."""
+    h, w = t.shape
+    return (t.reshape(h // patch_size, patch_size, w // patch_size, patch_size)
+             .permute(0, 2, 1, 3)
+             .reshape(-1, patch_size * patch_size))
+
+
+def patchwise_pearson_depth_loss(render_depth, prior_depth, valid_mask=None,
+                                 patch_size=32, min_valid_frac=0.5, var_floor=1e-6):
+    """Scale-invariant patch-wise depth loss (DNGaussian / FSGS / SparseGS style).
+
+    Pearson correlation is invariant to an affine remap of depth, so a prior of
+    unknown scale and offset still constrains geometry. It is computed over
+    non-overlapping patches rather than the whole image: a global correlation is
+    dominated by the coarse foreground/background split and barely constrains
+    local structure, which is where sparse-view floaters live.
+
+    Both depth maps are divided by their masked median first. Pearson is already
+    scale-free per patch, but the shared normalization puts `var_floor` in
+    dimensionless units so it means "this patch is flat" for either input.
+
+    Patches that are mostly invalid, or where the prior carries no depth
+    variation, are dropped: correlation is undefined there and the gradient
+    would be noise. Returns a 0-d tensor (detached zero if nothing survives).
+    """
+    if render_depth.dim() == 3:
+        render_depth = render_depth.squeeze(0)
+    if prior_depth.dim() == 3:
+        prior_depth = prior_depth.squeeze(0)
+
+    h, w = render_depth.shape
+    ph, pw = h - h % patch_size, w - w % patch_size
+    if ph == 0 or pw == 0:
+        return render_depth.new_zeros(())
+
+    x = render_depth[:ph, :pw]
+    y = prior_depth[:ph, :pw]
+    if valid_mask is None:
+        m = torch.ones_like(y)
+    else:
+        m = valid_mask.squeeze(0)[:ph, :pw].to(y.dtype)
+
+    if m.sum() < patch_size * patch_size:
+        return render_depth.new_zeros(())
+
+    # Shared normalization so var_floor is scale-free (see docstring).
+    sel = m > 0
+    x = x / x.detach()[sel].median().clamp_min(1e-8)
+    y = y / y[sel].median().clamp_min(1e-8)
+
+    x, y, m = (_to_patches(t, patch_size) for t in (x, y, m))
+
+    n = m.sum(1)
+    keep = n >= min_valid_frac * patch_size * patch_size
+    if not keep.any():
+        return render_depth.new_zeros(())
+    x, y, m, n = x[keep], y[keep], m[keep], n[keep]
+
+    xc = (x - (x * m).sum(1, keepdim=True) / n[:, None]) * m
+    yc = (y - (y * m).sum(1, keepdim=True) / n[:, None]) * m
+    var_x = (xc * xc).sum(1) / n
+    var_y = (yc * yc).sum(1) / n
+    cov = (xc * yc).sum(1) / n
+
+    # A flat prior patch has no ordering to transfer; a flat render patch would
+    # otherwise divide by ~0. Floor the render variance instead of dropping it,
+    # so empty regions still feel a pull toward the prior's structure.
+    ok = var_y > var_floor
+    if not ok.any():
+        return render_depth.new_zeros(())
+    corr = cov[ok] / (var_x[ok].clamp_min(var_floor) * var_y[ok]).sqrt()
+    return (1.0 - corr.clamp(-1.0, 1.0)).mean()
