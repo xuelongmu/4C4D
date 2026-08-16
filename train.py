@@ -175,7 +175,55 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("\nUsing DataLoader for training dataset")
     else:
         print("\nNot using DataLoader for training dataset")
-    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, 
+    if args.gpu_cache:
+        # Decode every training image once, hold the whole set as uint8 on the
+        # GPU (1500 frames at res 2 is ~4.2 GB), and pre-move the cameras.
+        # Removes the worker pool, per-iteration PNG decode, pageable H2D
+        # copies, and the per-item Camera deepcopy from the hot loop.
+        print("\nBuilding GPU-resident image cache "
+              f"({len(training_dataset)} images)...")
+        from concurrent.futures import ThreadPoolExecutor
+
+        def decode_to_uint8(i):
+            img, cam = training_dataset[i]
+            # Quantize inside the worker so host memory holds one uint8 frame
+            # rather than every decoded float32 frame at once: collecting the
+            # whole set as float32 first peaks at ~4x the final cache size and
+            # can exhaust host RAM before the transfer even starts.
+            img = (img * 255.0).round().to(torch.uint8)
+            # With dataloader=False the camera carries its own decoded float32
+            # image, and Camera.cuda() deepcopies every tensor attribute. Left
+            # in place that would put a second, 4x larger float copy of the same
+            # frame on the GPU beside the cache. The cache owns the pixels now.
+            cam.image = None
+            return img, cam
+
+        with ThreadPoolExecutor(max_workers=8) as pool:  # cv2 decode releases the GIL
+            cached = list(pool.map(decode_to_uint8, range(len(training_dataset))))
+        cache_cameras = [cam.cuda() for _, cam in cached]
+        shapes = {tuple(img.shape) for img, _ in cached}
+        if len(shapes) == 1:
+            # One contiguous allocation when the rig is uniform.
+            gpu_images = torch.stack([img for img, _ in cached]).cuda()
+            cache_bytes = gpu_images.numel()
+            shape_note = f"{tuple(gpu_images.shape)} uint8"
+        else:
+            # Mixed intrinsics give per-camera image sizes, which cannot stack.
+            # The list indexes identically and the render path is per-item.
+            gpu_images = [img.cuda() for img, _ in cached]
+            cache_bytes = sum(img.numel() for img in gpu_images)
+            shape_note = f"{len(gpu_images)} frames, {len(shapes)} distinct sizes, uint8"
+        del cached
+        print(f"GPU image cache: {shape_note}, {cache_bytes / 1e9:.2f} GB")
+
+        def gpu_cache_batches():
+            order = torch.randperm(len(cache_cameras)).tolist()
+            for start in range(0, len(order) - batch_size + 1, batch_size):
+                yield [(gpu_images[j], cache_cameras[j])
+                       for j in order[start:start + batch_size]]
+        training_dataloader = None
+    else:
+        training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True,
                                      num_workers=12 if dataset.dataloader else 0, collate_fn=lambda x: x, drop_last=True)
     
     img_dir = os.path.join(scene.model_path, "rendered_images")
@@ -183,7 +231,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     iteration = first_iter
     while iteration < opt.iterations + 1:
-        for batch_data in training_dataloader:
+        for batch_data in (gpu_cache_batches() if args.gpu_cache else training_dataloader):
             iteration += 1
             if iteration > opt.iterations:
                 break
@@ -204,7 +252,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             batch_visibility_filter = []
             batch_radii = []
 
-            batch_cams = [batch_data[i][1].cuda() for i in range(batch_size)]
+            # Cached cameras already live on the GPU; re-running Camera.cuda()
+            # would deepcopy each one every iteration and undo the cache.
+            batch_cams = [batch_data[i][1] if args.gpu_cache else batch_data[i][1].cuda()
+                          for i in range(batch_size)]
 
             # Opacity decay, applied exactly once per optimizer step rather than
             # once per batch item. Each gaussian's decay exponent is the number
@@ -242,7 +293,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             for batch_idx in range(batch_size):
                 gt_image, _ = batch_data[batch_idx]
                 viewpoint_cam = batch_cams[batch_idx]
-                gt_image = gt_image.cuda()
+                if args.gpu_cache:
+                    gt_image = gt_image.to(torch.float32).div_(255.0)
+                else:
+                    gt_image = gt_image.cuda()
 
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration,
                                     decayed_opacity=shared_opacity)
@@ -563,6 +617,8 @@ if __name__ == "__main__":
                         help='learn a per-training-camera 3x4 color affine applied to the training loss')
     parser.add_argument('--color_affine_lr', type=float, default=1e-4)
     parser.add_argument('--color_affine_weight_decay', type=float, default=1e-2)
+    parser.add_argument('--gpu_cache', action=BooleanOptionalAction, default=False,
+                        help='decode all training images once and keep them as uint8 on the GPU')
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
