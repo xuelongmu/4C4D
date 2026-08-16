@@ -252,8 +252,11 @@ class GaussianModel:
         else:
             return self.get_scaling_t * scaling_modifier
 
-    def get_marginal_t(self, timestamp, scaling_modifier = 1): # Standard
-        sigma = self.get_cov_t(scaling_modifier)
+    def get_marginal_t(self, timestamp, scaling_modifier = 1, cov_t=None): # Standard
+        # cov_t does not depend on the timestamp, so callers evaluating several
+        # viewpoints against the same parameters can compute it once and pass
+        # it in rather than rebuilding the 4D covariance chain per viewpoint.
+        sigma = self.get_cov_t(scaling_modifier) if cov_t is None else cov_t
         return torch.exp(-0.5*(self.get_t-timestamp)**2/sigma) # / torch.sqrt(2*torch.pi*sigma)
     
     def get_covariance(self, scaling_modifier = 1):
@@ -589,9 +592,20 @@ class GaussianModel:
             self.t_gradient_accum = self.t_gradient_accum[valid_points_mask]
 
     def opacity_decay(self, f_min=0.99, mode='net', p=2, f_max=1.0, mask=None, power=1):
-        # power compounds the decay factor to keep the effective per-step decay
-        # rate consistent with the released configs, which applied decay once
-        # per batch item (factor^batch_size per optimizer step at batch_size=4).
+        """Decay opacity once per optimizer step.
+
+        `power` is the exponent applied to the decay factor: either a scalar,
+        or an [N, 1] tensor holding, per gaussian, how many of the step's
+        viewpoints could see it. Compounding one factor this way keeps the
+        effective per-step decay consistent with the released configs, which
+        decayed once per batch item, while making the result independent of
+        batch order and composition. A count of 0 yields a factor of exactly 1,
+        so gaussians no viewpoint saw are left untouched.
+
+        The returned opacity keeps its autograd path to `coefficient`, so every
+        render in the step can share it and contribute to the coefficient's
+        gradient.
+        """
         old_opacity = self.get_opacity
         if mode == 'const':
             curr_opacity = old_opacity * f_min
@@ -613,7 +627,7 @@ class GaussianModel:
             if self.coefficient is None:
                 raise ValueError("Coefficient is not defined")
             factor = f_min + (f_max - f_min) * self.coefficient(old_opacity, self.get_xyzt, self.get_scaling_xyzt)
-            if power != 1:
+            if torch.is_tensor(power) or power != 1:
                 factor = factor ** power
             curr_opacity = old_opacity * factor
         elif mode == 'power_desc': 
@@ -625,10 +639,12 @@ class GaussianModel:
         else:
             raise NotImplementedError("Opacity decay mode not implemented")
         
-        opacity = old_opacity
-        if mask is not None: 
-            opacity = torch.where(mask, curr_opacity, old_opacity)
-            
+        # A per-gaussian `power` already encodes visibility (count 0 leaves the
+        # opacity unchanged), so `mask` is only needed by the modes that ignore
+        # `power`. Previously a None mask discarded curr_opacity entirely, which
+        # made decay a silent no-op whenever time_aware was off.
+        opacity = curr_opacity if mask is None else torch.where(mask, curr_opacity, old_opacity)
+
         self._opacity.data = self.inverse_opacity_activation(opacity)
         return opacity
           

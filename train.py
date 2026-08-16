@@ -16,7 +16,7 @@ import random
 import torch
 from torch import nn
 from utils.loss_utils import l1_loss #, ssim, msssim
-from gaussian_renderer import render
+from gaussian_renderer import render, decay_visibility
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -44,13 +44,37 @@ except ImportError:
 from datetime import datetime
 
 
+def color_affine_key(image_name):
+    """Camera identity behind a frame's image name, for per-camera color affine.
+
+    Rig captures name frames <camera>_<frame> (cam03_0117), so the trailing
+    frame number is dropped; anything else is used whole.
+    """
+    head, sep, tail = image_name.rpartition('_')
+    return head if sep and tail.isdigit() else image_name
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
 
+    # The regularizer losses behind lambda_opa_mask/lambda_rigid/lambda_motion
+    # are not implemented; the previous vars()-based EMA plumbing silently did
+    # nothing and would raise KeyError if a lambda were nonzero. Fail fast
+    # instead of training something other than what the config claims, and do
+    # it before the logger, model, and scene are built so an invalid config
+    # does not pay the dataset load and CUDA allocations first.
+    unimplemented_lambdas = [key for key in opt.__dict__.keys()
+                             if key.startswith('lambda') and key != 'lambda_dssim'
+                             and opt.__dict__[key] != 0]
+    if unimplemented_lambdas:
+        raise NotImplementedError(
+            f"Losses for {unimplemented_lambdas} are not implemented; set them to 0 "
+            "or implement the corresponding regularizers.")
+
     if dataset.frame_ratio > 1:
         time_duration = [time_duration[0] / dataset.frame_ratio,  time_duration[1] / dataset.frame_ratio]
-    
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     
@@ -84,18 +108,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_l1loss_for_log = 0.0
     ema_ssimloss_for_log = 0.0
-    # The regularizer losses behind lambda_opa_mask/lambda_rigid/lambda_motion
-    # are not implemented; the previous vars()-based EMA plumbing silently did
-    # nothing and would raise KeyError if a lambda were nonzero. Fail fast
-    # instead of training something other than what the config claims.
-    unimplemented_lambdas = [key for key in opt.__dict__.keys()
-                             if key.startswith('lambda') and key != 'lambda_dssim'
-                             and opt.__dict__[key] > 0]
-    if unimplemented_lambdas:
-        raise NotImplementedError(
-            f"Losses for {unimplemented_lambdas} are not implemented; set them to 0 "
-            "or implement the corresponding regularizers.")
-    
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training", ncols=110)
     first_iter += 1
         
@@ -121,15 +134,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     color_affine_optimizer = None
     color_affine_index = {}
     if args.color_affine:
-        if args.training_view:
-            cam_names = list(args.training_view)
-        else:
-            cam_names = sorted({c.image_name.split('_')[0] for c in training_dataset.viewpoint_stack})
+        # Index by the cameras actually in the training set, not by
+        # args.training_view: the Blender loader ignores that list entirely, and
+        # the Colmap loader only honours it when eval is on, so with the default
+        # eval=False every camera outside the list missed the lookup, fell back
+        # to the never-optimized anchor at index 0, and the feature silently did
+        # nothing.
+        cam_names = sorted({color_affine_key(c.image_name)
+                            for c in training_dataset.viewpoint_stack})
         color_affine_index = {name: i for i, name in enumerate(cam_names)}
+        if len(cam_names) < 2:
+            print(f"Warning: --color_affine found {len(cam_names)} distinct camera(s) "
+                  f"({cam_names}); every view maps to the identity anchor, so "
+                  "compensation is a no-op for this dataset")
         color_affine_delta = nn.Parameter(torch.zeros(len(cam_names), 3, 4, device="cuda"))
         color_affine_optimizer = torch.optim.AdamW(
             [color_affine_delta], lr=args.color_affine_lr, weight_decay=args.color_affine_weight_decay)
         color_affine_eye = torch.eye(3, 4, device="cuda")
+
+        # Resuming must continue from the saved compensation, not from identity
+        # with a fresh optimizer, which would abruptly change the training
+        # objective mid-run.
+        if checkpoint:
+            affine_state_path = os.path.join(
+                os.path.dirname(checkpoint) or ".", "color_affine_resume.pth")
+            if os.path.exists(affine_state_path):
+                affine_state = torch.load(affine_state_path)
+                if affine_state['index'] == color_affine_index:
+                    color_affine_delta.data.copy_(affine_state['affine_delta'].cuda())
+                    color_affine_optimizer.load_state_dict(affine_state['optimizer'])
+                    print(f"Restored color affine state from {affine_state_path}")
+                else:
+                    print(f"Warning: {affine_state_path} indexes different cameras "
+                          "than this run; starting color affine from identity")
+            else:
+                print(f"Warning: --color_affine resumed from {checkpoint} but no "
+                      f"{os.path.basename(affine_state_path)} beside it; "
+                      "starting color affine from identity")
     if dataset.dataloader:
         print("\nUsing DataLoader for training dataset")
     else:
@@ -142,14 +183,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("\nBuilding GPU-resident image cache "
               f"({len(training_dataset)} images)...")
         from concurrent.futures import ThreadPoolExecutor
+
+        def decode_to_uint8(i):
+            img, cam = training_dataset[i]
+            # Quantize inside the worker so host memory holds one uint8 frame
+            # rather than every decoded float32 frame at once: collecting the
+            # whole set as float32 first peaks at ~4x the final cache size and
+            # can exhaust host RAM before the transfer even starts.
+            img = (img * 255.0).round().to(torch.uint8)
+            # With dataloader=False the camera carries its own decoded float32
+            # image, and Camera.cuda() deepcopies every tensor attribute. Left
+            # in place that would put a second, 4x larger float copy of the same
+            # frame on the GPU beside the cache. The cache owns the pixels now.
+            cam.image = None
+            return img, cam
+
         with ThreadPoolExecutor(max_workers=8) as pool:  # cv2 decode releases the GIL
-            cached = list(pool.map(lambda i: training_dataset[i], range(len(training_dataset))))
+            cached = list(pool.map(decode_to_uint8, range(len(training_dataset))))
         cache_cameras = [cam.cuda() for _, cam in cached]
-        gpu_images = torch.stack(
-            [(img * 255.0).round().to(torch.uint8) for img, _ in cached]).cuda()
+        shapes = {tuple(img.shape) for img, _ in cached}
+        if len(shapes) == 1:
+            # One contiguous allocation when the rig is uniform.
+            gpu_images = torch.stack([img for img, _ in cached]).cuda()
+            cache_bytes = gpu_images.numel()
+            shape_note = f"{tuple(gpu_images.shape)} uint8"
+        else:
+            # Mixed intrinsics give per-camera image sizes, which cannot stack.
+            # The list indexes identically and the render path is per-item.
+            gpu_images = [img.cuda() for img, _ in cached]
+            cache_bytes = sum(img.numel() for img in gpu_images)
+            shape_note = f"{len(gpu_images)} frames, {len(shapes)} distinct sizes, uint8"
         del cached
-        print(f"GPU image cache: {tuple(gpu_images.shape)} uint8, "
-              f"{gpu_images.numel() / 1e9:.2f} GB")
+        print(f"GPU image cache: {shape_note}, {cache_bytes / 1e9:.2f} GB")
 
         def gpu_cache_batches():
             order = torch.randperm(len(cache_cameras)).tolist()
@@ -186,23 +251,61 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             batch_point_grad = []
             batch_visibility_filter = []
             batch_radii = []
-            
+
+            # Cached cameras already live on the GPU; re-running Camera.cuda()
+            # would deepcopy each one every iteration and undo the cache.
+            batch_cams = [batch_data[i][1] if args.gpu_cache else batch_data[i][1].cuda()
+                          for i in range(batch_size)]
+
+            # Opacity decay, applied exactly once per optimizer step rather than
+            # once per batch item. Each gaussian's decay exponent is the number
+            # of the step's viewpoints that can see it, so the result does not
+            # depend on which camera happens to come first in the shuffled
+            # batch.
+            #
+            # Every render in the step shares the decayed opacity, but each one
+            # backpropagates separately, so the shared tensor is handed to them
+            # as a detached leaf: the per-item backward passes accumulate into
+            # its .grad instead of trying to walk (and free) the one decay
+            # subgraph four times. That subgraph is backpropagated once after
+            # the loop, which is also what carries the render gradients back to
+            # _opacity and the coefficient network.
+            decayed_opacity = None
+            shared_opacity = None
+            if args.opacity_decay and iteration > args.decay_from_iter:
+                if args.time_aware:
+                    visibility_counts = torch.zeros(gaussians.get_xyz.shape[0], 1, device="cuda")
+                    # The temporal covariance is the expensive part of the
+                    # visibility test (build_scaling_rotation_4d plus two
+                    # batched Nx4x4 GEMMs) and is the same for every viewpoint
+                    # in the step, so build it once instead of per camera.
+                    with torch.no_grad():
+                        cov_t = gaussians.get_cov_t()
+                    for cam in batch_cams:
+                        visibility_counts += decay_visibility(
+                            cam, gaussians, pipe, background, cov_t=cov_t).view(-1, 1).float()
+                else:
+                    visibility_counts = batch_size
+                decayed_opacity = gaussians.opacity_decay(
+                    f_min=args.f_min, f_max=args.f_max, power=visibility_counts)
+                shared_opacity = decayed_opacity.detach().requires_grad_(True)
+
             for batch_idx in range(batch_size):
-                gt_image, viewpoint_cam = batch_data[batch_idx]
+                gt_image, _ = batch_data[batch_idx]
+                viewpoint_cam = batch_cams[batch_idx]
                 if args.gpu_cache:
                     gt_image = gt_image.to(torch.float32).div_(255.0)
                 else:
                     gt_image = gt_image.cuda()
-                    viewpoint_cam = viewpoint_cam.cuda()
-                
+
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration,
-                                    apply_decay=(batch_idx == 0))
+                                    decayed_opacity=shared_opacity)
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                 # depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
                 # Loss (per-camera color affine applies only to the training loss;
                 # eval and held-out renders stay raw; camera 0 is the anchor)
-                affine_idx = color_affine_index.get(viewpoint_cam.image_name.split('_')[0], 0) \
+                affine_idx = color_affine_index.get(color_affine_key(viewpoint_cam.image_name), 0) \
                     if color_affine_delta is not None else 0
                 if color_affine_delta is not None and affine_idx != 0:
                     affine = color_affine_eye + color_affine_delta[affine_idx]
@@ -219,7 +322,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 batch_point_grad.append(torch.norm(viewspace_point_tensor.grad[:,:2], dim=-1))
                 batch_radii.append(radii)
                 batch_visibility_filter.append(visibility_filter)
-                
+
+            # Chain the batch's accumulated opacity gradient through the decay
+            # subgraph exactly once, reaching _opacity and the coefficient.
+            if shared_opacity is not None and shared_opacity.grad is not None:
+                decayed_opacity.backward(shared_opacity.grad)
+
             if (iteration % 1500 == 0 or iteration == 2):  # Save every 100 iterations
                 # Convert rendered image tensor to numpy and save
                 image = torch.clamp(image, 0.0, 1.0)
@@ -374,9 +482,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
                     if color_affine_delta is not None:
-                        torch.save({'index': color_affine_index,
-                                    'affine_delta': color_affine_delta.detach().cpu()},
+                        affine_state = {'index': color_affine_index,
+                                        'affine_delta': color_affine_delta.detach().cpu(),
+                                        'optimizer': color_affine_optimizer.state_dict(),
+                                        'iteration': iteration}
+                        torch.save(affine_state,
                                    os.path.join(scene.model_path, f"color_affine_{iteration}.pth"))
+                        # Fixed name next to the checkpoints so --start_checkpoint
+                        # can find the matching affine state without being told
+                        # which iteration to look for.
+                        torch.save(affine_state,
+                                   os.path.join(scene.model_path, "color_affine_resume.pth"))
         
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -535,8 +651,22 @@ if __name__ == "__main__":
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
     args = parser.parse_args(sys.argv[1:])
+
+    # Which options were actually typed on the command line. argparse only
+    # fills in a default for a dest that is not already present on the
+    # namespace, so parsing a second time into a namespace pre-seeded with
+    # sentinels leaves every option the command line did not set as the
+    # sentinel. The YAML merge below assigns every configured leaf onto args,
+    # which would otherwise silently discard an explicit flag: with
+    # opacity_decay or time_aware present in the config, --no-opacity_decay
+    # and --no-time_aware had no effect at all.
+    _unset = object()
+    cli_probe = Namespace(**{a.dest: _unset for a in parser._actions if a.dest != "help"})
+    parser.parse_args(sys.argv[1:], namespace=cli_probe)
+    cli_explicit = {dest for dest, value in vars(cli_probe).items() if value is not _unset}
+
     args.save_iterations.append(args.iterations)
-        
+
     cfg = OmegaConf.load(args.config)
     def recursive_merge(key, host):
         if isinstance(host[key], DictConfig):
@@ -544,6 +674,8 @@ if __name__ == "__main__":
                 recursive_merge(key1, host[key])
         else:
             assert hasattr(args, key), key
+            if key in cli_explicit:
+                return  # an explicit command-line value outranks the config
             setattr(args, key, host[key])
     for k in cfg.keys():
         recursive_merge(k, cfg)
