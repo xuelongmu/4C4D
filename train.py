@@ -418,16 +418,66 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if args.opacity_decay:
                             size_threshold = None
                         prune_only = opt.densify_until_num_points > 0 and gaussians.get_xyz.shape[0] >= opt.densify_until_num_points
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.thresh_opa_prune, scene.cameras_extent, 
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.thresh_opa_prune, scene.cameras_extent,
                                                     size_threshold, opt.densify_grad_t_threshold, prune_only=prune_only)
+                        # Cloning/splitting appends rows and pruning compacts
+                        # them, so row i is no longer the same gaussian. A
+                        # length check cannot see that when the two happen to
+                        # cancel out, which would freeze unrelated gaussians
+                        # until the next refresh; drop the mask outright.
+                        gaussians.static_mask = None
                     
                     if ((iteration % opt.opacity_reset_interval == 0 and not args.opacity_decay) or (
                         dataset.white_background and iteration == opt.densify_from_iter)) and args.reset_opacity:
                         gaussians.reset_opacity()
                         
+                # Static/dynamic split (lite): gaussians whose temporal marginal
+                # exceeds the render gate at both clip endpoints cover the whole
+                # clip and are effectively static. Holding their temporal
+                # parameters still stops background gaussians from churning in
+                # time, reserving temporal capacity for the performer.
+                #
+                # Known limitation under --rot_4d: get_cov_t builds the temporal
+                # marginal from the full space-time covariance, so _rotation and
+                # _scaling still influence it and are deliberately left
+                # trainable here. This pins the purely temporal parameters, not
+                # the whole temporal support.
+                frozen_rows = None
+                if (args.freeze_static_temporal and gaussians.gaussian_dim == 4
+                        and iteration > opt.densify_from_iter):
+                    sm = gaussians.static_mask
+                    if (iteration % 100 == 0 or sm is None
+                            or sm.shape[0] != gaussians._t.shape[0]):
+                        t0, t1 = gaussians.time_duration
+                        cov_t = gaussians.get_cov_t()
+                        t = gaussians.get_t
+                        m0 = torch.exp(-0.5 * (t - t0) ** 2 / cov_t)[:, 0] > 0.05
+                        m1 = torch.exp(-0.5 * (t - t1) ** 2 / cov_t)[:, 0] > 0.05
+                        sm = gaussians.static_mask = m0 & m1
+                        if iteration % 500 == 0:
+                            print(f"\n[ITER {iteration}] static fraction: "
+                                  f"{sm.float().mean().item():.3f}")
+                    params_t = [gaussians._t, gaussians._scaling_t]
+                    if gaussians.rot_4d:
+                        params_t.append(gaussians._rotation_r)
+                    for p in params_t:
+                        if p.grad is not None:
+                            p.grad[sm] = 0.0
+                    # A zero gradient does not hold these rows still: Adam
+                    # carries first- and second-moment state from before the
+                    # gaussian became static, and keeps stepping on it until
+                    # that momentum decays. Snapshot the frozen rows and put
+                    # them back after the step, which is exact regardless of
+                    # what the optimizer does internally.
+                    frozen_rows = [(p, p.data[sm].clone()) for p in params_t]
+
                 # Optimizer step
                 if iteration < opt.iterations:
                     gaussians.optimizer.step()
+                    if frozen_rows is not None:
+                        with torch.no_grad():
+                            for p, saved in frozen_rows:
+                                p.data[sm] = saved
                     gaussians.optimizer.zero_grad(set_to_none = True)
                     
                     if gaussians.coefficient is not None:
@@ -619,6 +669,8 @@ if __name__ == "__main__":
     parser.add_argument('--color_affine_weight_decay', type=float, default=1e-2)
     parser.add_argument('--gpu_cache', action=BooleanOptionalAction, default=False,
                         help='decode all training images once and keep them as uint8 on the GPU')
+    parser.add_argument('--freeze_static_temporal', action=BooleanOptionalAction, default=False,
+                        help='zero temporal gradients of gaussians whose support spans the whole clip')
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
