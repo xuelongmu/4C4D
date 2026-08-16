@@ -48,9 +48,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
 
+    # The regularizer losses behind lambda_opa_mask/lambda_rigid/lambda_motion
+    # are not implemented; the previous vars()-based EMA plumbing silently did
+    # nothing and would raise KeyError if a lambda were nonzero. Fail fast
+    # instead of training something other than what the config claims, and do
+    # it before the logger, model, and scene are built so an invalid config
+    # does not pay the dataset load and CUDA allocations first.
+    unimplemented_lambdas = [key for key in opt.__dict__.keys()
+                             if key.startswith('lambda') and key != 'lambda_dssim'
+                             and opt.__dict__[key] != 0]
+    if unimplemented_lambdas:
+        raise NotImplementedError(
+            f"Losses for {unimplemented_lambdas} are not implemented; set them to 0 "
+            "or implement the corresponding regularizers.")
+
     if dataset.frame_ratio > 1:
         time_duration = [time_duration[0] / dataset.frame_ratio,  time_duration[1] / dataset.frame_ratio]
-    
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     
@@ -84,18 +98,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_l1loss_for_log = 0.0
     ema_ssimloss_for_log = 0.0
-    # The regularizer losses behind lambda_opa_mask/lambda_rigid/lambda_motion
-    # are not implemented; the previous vars()-based EMA plumbing silently did
-    # nothing and would raise KeyError if a lambda were nonzero. Fail fast
-    # instead of training something other than what the config claims.
-    unimplemented_lambdas = [key for key in opt.__dict__.keys()
-                             if key.startswith('lambda') and key != 'lambda_dssim'
-                             and opt.__dict__[key] > 0]
-    if unimplemented_lambdas:
-        raise NotImplementedError(
-            f"Losses for {unimplemented_lambdas} are not implemented; set them to 0 "
-            "or implement the corresponding regularizers.")
-    
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training", ncols=110)
     first_iter += 1
         
