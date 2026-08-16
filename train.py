@@ -429,8 +429,22 @@ if __name__ == "__main__":
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
     args = parser.parse_args(sys.argv[1:])
+
+    # Which options were actually typed on the command line. argparse only
+    # fills in a default for a dest that is not already present on the
+    # namespace, so parsing a second time into a namespace pre-seeded with
+    # sentinels leaves every option the command line did not set as the
+    # sentinel. The YAML merge below assigns every configured leaf onto args,
+    # which would otherwise silently discard an explicit flag: with
+    # opacity_decay or time_aware present in the config, --no-opacity_decay
+    # and --no-time_aware had no effect at all.
+    _unset = object()
+    cli_probe = Namespace(**{a.dest: _unset for a in parser._actions if a.dest != "help"})
+    parser.parse_args(sys.argv[1:], namespace=cli_probe)
+    cli_explicit = {dest for dest, value in vars(cli_probe).items() if value is not _unset}
+
     args.save_iterations.append(args.iterations)
-        
+
     cfg = OmegaConf.load(args.config)
     def recursive_merge(key, host):
         if isinstance(host[key], DictConfig):
@@ -438,6 +452,8 @@ if __name__ == "__main__":
                 recursive_merge(key1, host[key])
         else:
             assert hasattr(args, key), key
+            if key in cli_explicit:
+                return  # an explicit command-line value outranks the config
             setattr(args, key, host[key])
     for k in cfg.keys():
         recursive_merge(k, cfg)
