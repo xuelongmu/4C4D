@@ -240,14 +240,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             with torch.no_grad():
                 if iteration % 10 == 0:
-                    psnr_for_log = psnr(image, gt_image).mean().double()
-                    # Progress bar
-                    ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                    ema_l1loss_for_log = 0.4 * Ll1.item() + 0.6 * ema_l1loss_for_log
-                    ema_ssimloss_for_log = 0.4 * Lssim.item() + 0.6 * ema_ssimloss_for_log
+                    # One fused D2H transfer instead of four separate syncs
+                    loss_val, l1_val, ssim_val, psnr_val = torch.stack(
+                        [loss.detach(), Ll1.detach(), Lssim.detach(),
+                         psnr(image, gt_image).mean()]).tolist()
+                    ema_loss_for_log = 0.4 * loss_val + 0.6 * ema_loss_for_log
+                    ema_l1loss_for_log = 0.4 * l1_val + 0.6 * ema_l1loss_for_log
+                    ema_ssimloss_for_log = 0.4 * ssim_val + 0.6 * ema_ssimloss_for_log
 
                     postfix = {"Loss": f"{ema_loss_for_log:.{7}f}",
-                                "PSNR": f"{psnr_for_log:.{2}f}",
+                                "PSNR": f"{psnr_val:.{2}f}",
                                 "gs_num":f"{gaussians.get_xyz.shape[0]}"}
 
                     progress_bar.set_postfix(postfix)
@@ -271,9 +273,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # Densification
                 if iteration < opt.densify_until_iter:
-                    # Keep track of max radii in image-space for pruning
-                    gaussians.max_radii2D[visibility_filter] = torch.max(
-                        gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    # max_radii2D feeds only the size_threshold prune, which is
+                    # disabled under opacity_decay; skip the masked max then.
+                    if args.add_size_threshold and not args.opacity_decay:
+                        gaussians.max_radii2D[visibility_filter] = torch.max(
+                            gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                     if batch_size == 1:
                         gaussians.add_densification_stats(viewspace_point_tensor, 
                                     visibility_filter, batch_t_grad if gaussians.gaussian_dim == 4 else None)
@@ -349,7 +353,6 @@ def training_report(tb_writer, iteration, Ll1, Lssim, loss, l1_loss, elapsed, te
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
         tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
 
     psnr_test_iter = 0.0
     # Report test and samples of training set
@@ -402,8 +405,9 @@ def training_report(tb_writer, iteration, Ll1, Lssim, loss, l1_loss, elapsed, te
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
                 if config['name'] == 'test':
                     psnr_test_iter = psnr_test.item()
-                    
-    torch.cuda.empty_cache()
+        # Only release cached blocks after a full evaluation pass; doing this
+        # every 100 iterations forced a device sync + allocator flush.
+        torch.cuda.empty_cache()
     return psnr_test_iter
 
 def setup_seed(seed):
