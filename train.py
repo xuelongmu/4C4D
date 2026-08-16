@@ -16,7 +16,7 @@ import random
 import torch
 from torch import nn
 from utils.loss_utils import l1_loss #, ssim, msssim
-from gaussian_renderer import render
+from gaussian_renderer import render, decay_visibility
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -186,17 +186,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             batch_point_grad = []
             batch_visibility_filter = []
             batch_radii = []
-            
+
+            # Cached cameras already live on the GPU; re-running Camera.cuda()
+            # would deepcopy each one every iteration and undo the cache.
+            batch_cams = [batch_data[i][1] if args.gpu_cache else batch_data[i][1].cuda()
+                          for i in range(batch_size)]
+
+            # Opacity decay, applied exactly once per optimizer step rather than
+            # once per batch item. Each gaussian's decay exponent is the number
+            # of the step's viewpoints that can see it, so the result does not
+            # depend on which camera happens to come first in the shuffled
+            # batch.
+            #
+            # Every render in the step shares the decayed opacity, but each one
+            # backpropagates separately, so the shared tensor is handed to them
+            # as a detached leaf: the per-item backward passes accumulate into
+            # its .grad instead of trying to walk (and free) the one decay
+            # subgraph four times. That subgraph is backpropagated once after
+            # the loop, which is also what carries the render gradients back to
+            # _opacity and the coefficient network.
+            decayed_opacity = None
+            shared_opacity = None
+            if args.opacity_decay and iteration > args.decay_from_iter:
+                if args.time_aware:
+                    visibility_counts = torch.zeros(gaussians.get_xyz.shape[0], 1, device="cuda")
+                    for cam in batch_cams:
+                        visibility_counts += decay_visibility(
+                            cam, gaussians, pipe, background).view(-1, 1).float()
+                else:
+                    visibility_counts = batch_size
+                decayed_opacity = gaussians.opacity_decay(
+                    f_min=args.f_min, f_max=args.f_max, power=visibility_counts)
+                shared_opacity = decayed_opacity.detach().requires_grad_(True)
+
             for batch_idx in range(batch_size):
-                gt_image, viewpoint_cam = batch_data[batch_idx]
+                gt_image, _ = batch_data[batch_idx]
+                viewpoint_cam = batch_cams[batch_idx]
                 if args.gpu_cache:
                     gt_image = gt_image.to(torch.float32).div_(255.0)
                 else:
                     gt_image = gt_image.cuda()
-                    viewpoint_cam = viewpoint_cam.cuda()
-                
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration,
-                                    apply_decay=(batch_idx == 0))
+                                    decayed_opacity=shared_opacity)
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                 # depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
@@ -219,7 +250,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 batch_point_grad.append(torch.norm(viewspace_point_tensor.grad[:,:2], dim=-1))
                 batch_radii.append(radii)
                 batch_visibility_filter.append(visibility_filter)
-                
+
+            # Chain the batch's accumulated opacity gradient through the decay
+            # subgraph exactly once, reaching _opacity and the coefficient.
+            if shared_opacity is not None and shared_opacity.grad is not None:
+                decayed_opacity.backward(shared_opacity.grad)
+
             if (iteration % 1500 == 0 or iteration == 2):  # Save every 100 iterations
                 # Convert rendered image tensor to numpy and save
                 image = torch.clamp(image, 0.0, 1.0)
