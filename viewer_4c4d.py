@@ -28,6 +28,7 @@ import numpy as np
 OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0])
 MIN_FOCAL_LENGTH_MM = 1.0
 MAX_FOCAL_LENGTH_MM = 500.0
+MAX_RENDER_EDGE = 4096
 
 
 def quaternion_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
@@ -170,6 +171,26 @@ def interpolate_keyframes(keyframes: list[ShotKeyframe], shot_frame: float, smoo
     )
 
 
+def trim_keyframes_to_duration(
+    keyframes: list[ShotKeyframe],
+    duration_frames: int,
+    smooth: bool,
+) -> list[ShotKeyframe]:
+    """Trim a shot while preserving its evaluated pose at the new endpoint."""
+    ordered = sorted(keyframes, key=lambda key: key.shot_frame)
+    last_frame = max(int(duration_frames) - 1, 0)
+    if not ordered or ordered[-1].shot_frame <= last_frame:
+        return ordered
+    endpoint = interpolate_keyframes(ordered, last_frame, smooth)
+    endpoint = ShotKeyframe(
+        shot_frame=last_frame,
+        wxyz=np.asarray(endpoint.wxyz, dtype=np.float64).copy(),
+        position=np.asarray(endpoint.position, dtype=np.float64).copy(),
+        fov_y=float(endpoint.fov_y),
+    )
+    return [key for key in ordered if key.shot_frame < last_frame] + [endpoint]
+
+
 def scene_frame_for_shot(
     shot_frame: float,
     shot_fps: float,
@@ -181,6 +202,26 @@ def scene_frame_for_shot(
     native_scene_fps = float(num_scene_frames) / duration_seconds
     scene_frame = float(shot_frame) / max(float(shot_fps), 1.0) * native_scene_fps
     return float(np.clip(scene_frame, 0.0, max(num_scene_frames - 1, 0)))
+
+
+def render_resolution_for_long_edge(
+    long_edge: int,
+    aspect: float,
+    max_edge: int = MAX_RENDER_EDGE,
+) -> tuple[int, int]:
+    """Return an even render size with a bounded landscape or portrait long edge."""
+    edge = int(np.clip(int(long_edge), 2, max(int(max_edge), 2)))
+    edge -= edge % 2
+    aspect = max(float(aspect), 1e-6)
+    if aspect >= 1.0:
+        width = edge
+        height = max(2, int(round(width / aspect)))
+    else:
+        height = edge
+        width = max(2, int(round(height * aspect)))
+    width -= width % 2
+    height -= height % 2
+    return width, height
 
 
 def focal_length_to_fov_y(focal_length_mm: float, sensor_height_mm: float) -> float:
@@ -232,6 +273,63 @@ def preview_fov_y_for_gate(shot_fov_y: float, viewport_aspect: float, shot_aspec
     if viewport_aspect >= shot_aspect:
         return float(shot_fov_y)
     return 2.0 * math.atan(math.tan(float(shot_fov_y) * 0.5) * shot_aspect / viewport_aspect)
+
+
+def preview_projection_matches_scene(
+    shot_fov_y: float,
+    viewport_aspect: float,
+    shot_aspect: float,
+    preview_framing: bool,
+) -> bool:
+    """Return whether Viser overlays share the framed background projection."""
+    return not preview_framing or math.isclose(
+        preview_fov_y_for_gate(shot_fov_y, viewport_aspect, shot_aspect),
+        float(shot_fov_y),
+        rel_tol=1e-7,
+        abs_tol=1e-7,
+    )
+
+
+def scheduled_shot_frame(
+    start_frame: int,
+    elapsed_seconds: float,
+    fps: int,
+    duration_frames: int,
+    loop: bool,
+) -> tuple[int, bool]:
+    """Map monotonic elapsed time to a shot frame and completion state."""
+    duration_frames = max(int(duration_frames), 1)
+    fps = max(int(fps), 1)
+    elapsed_frames = max(int(math.floor(max(float(elapsed_seconds), 0.0) * fps + 1e-9)), 0)
+    unwrapped_frame = max(int(start_frame), 0) + elapsed_frames
+    if loop:
+        return unwrapped_frame % duration_frames, False
+    return min(unwrapped_frame, duration_frames - 1), unwrapped_frame >= duration_frames
+
+
+def shot_playback_needs_rebase(
+    is_playing: bool,
+    live_frame: int,
+    last_scheduled_frame: int,
+) -> bool:
+    """Detect a playhead change that did not come from the playback worker."""
+    return bool(is_playing) and int(live_frame) != int(last_scheduled_frame)
+
+
+def shot_playback_config_changed(
+    previous_fps: int,
+    previous_duration: int,
+    previous_loop: bool,
+    current_fps: int,
+    current_duration: int,
+    current_loop: bool,
+) -> bool:
+    """Detect timing-topology changes that require a fresh playback anchor."""
+    return (
+        int(previous_fps) != int(current_fps)
+        or int(previous_duration) != int(current_duration)
+        or bool(previous_loop) != bool(current_loop)
+    )
 
 
 def export_keyframes(
@@ -401,7 +499,7 @@ def shot_to_gltf_bytes(
             {"bufferView": 3, "componentType": 5126, "count": len(ordered), "type": "SCALAR"},
         ],
         "extensionsUsed": ["KHR_animation_pointer"],
-        "animations": [{"name": name, "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}, {"input": 0, "output": 2, "interpolation": "LINEAR"}, {"input": 0, "output": 3, "interpolation": "LINEAR"}], "channels": [{"sampler": 0, "target": {"node": 1, "path": "translation"}}, {"sampler": 1, "target": {"node": 1, "path": "rotation"}}, {"sampler": 2, "target": {"extensions": {"KHR_animation_pointer": {"pointer": "/cameras/0/perspective/yfov"}}}}]}],
+        "animations": [{"name": name, "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}, {"input": 0, "output": 2, "interpolation": "LINEAR"}, {"input": 0, "output": 3, "interpolation": "LINEAR"}], "channels": [{"sampler": 0, "target": {"node": 1, "path": "translation"}}, {"sampler": 1, "target": {"node": 1, "path": "rotation"}}, {"sampler": 2, "target": {"path": "pointer", "extensions": {"KHR_animation_pointer": {"pointer": "/cameras/0/perspective/yfov"}}}}]}],
         "extras": {
             "fps": fps,
             "shot_aspect_ratio": shot_aspect,
@@ -560,28 +658,6 @@ class ReferenceCamera:
     def viser_pose(self) -> tuple[np.ndarray, np.ndarray]:
         return opencv_c2w_to_viser(self.c2w_cv)
 
-    def rotated_ccw(self, degrees: int) -> "ReferenceCamera":
-        """Return an equivalent camera for an image rotated CCW in 90-degree steps."""
-        quarter_turns = (degrees // 90) % 4
-        angle = math.radians(90 * quarter_turns)
-        camera_roll = np.array(
-            [
-                [math.cos(angle), -math.sin(angle), 0.0],
-                [math.sin(angle), math.cos(angle), 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
-        )
-        c2w = self.c2w_cv.copy()
-        c2w[:3, :3] = c2w[:3, :3] @ camera_roll
-        if quarter_turns % 2:
-            width, height = self.height, self.width
-            fx, fy = self.fy, self.fx
-        else:
-            width, height = self.width, self.height
-            fx, fy = self.fx, self.fy
-        return ReferenceCamera(self.name, width, height, fx, fy, c2w)
-
 
 class RenderCamera:
     """Minimal camera interface consumed by gaussian_renderer.render()."""
@@ -705,7 +781,7 @@ def load_model(config_path: Path, checkpoint_path: Path) -> tuple[Any, Any, int,
     return model, pipe, int(iteration), time_duration
 
 
-def frame_to_timestamp(frame: int, num_frames: int, time_duration: tuple[float, float]) -> float:
+def frame_to_timestamp(frame: float, num_frames: int, time_duration: tuple[float, float]) -> float:
     start, end = time_duration
     return start + (end - start) * float(frame) / float(num_frames)
 
@@ -732,7 +808,7 @@ def render_shot_mp4(
     keyframes: list[ShotKeyframe],
     duration_frames: int,
     fps: int,
-    width: int,
+    long_edge: int,
     aspect: float,
     interpolation: str,
     num_scene_frames: int,
@@ -742,11 +818,10 @@ def render_shot_mp4(
     output_path: Path,
     progress_callback: Any,
     cancelled: threading.Event,
+    render_lock: Any,
 ) -> None:
     """Render an interpolated camera move and stream RGB frames into ffmpeg."""
-    width -= width % 2
-    height = max(64, int(round(width / max(aspect, 1e-6))))
-    height -= height % 2
+    width, height = render_resolution_for_long_edge(long_edge, aspect)
     command = [
         "ffmpeg",
         "-loglevel",
@@ -792,7 +867,10 @@ def render_shot_mp4(
                 frame=scene_frame_for_shot(shot_frame, fps, num_scene_frames, time_duration),
                 render_width=width,
             )
-            image, _ = render_image(model, pipe, snapshot, num_scene_frames, time_duration, white_background)
+            with render_lock:
+                image, _ = render_image(
+                    model, pipe, snapshot, num_scene_frames, time_duration, white_background
+                )
             process.stdin.write(np.ascontiguousarray(image).tobytes())
             progress_callback((shot_frame + 1) / duration_frames, shot_frame + 1)
         process.stdin.close()
@@ -877,11 +955,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             "4:3 · Academy": 4.0 / 3.0,
             "9:16 · Vertical": 9.0 / 16.0,
         }
-        reference_aspect = initial_reference.width / initial_reference.height
-        initial_aspect_label = min(
-            aspect_options, key=lambda label: abs(math.log(aspect_options[label] / reference_aspect))
-        )
-        initial_shot_aspect = aspect_options[initial_aspect_label]
+        initial_shot_aspect = aspect_options["16:9 · UHD"]
         sensor_presets: dict[str, tuple[float, float] | None] = {
             "Super 35 · 4-perf (24.89 × 18.66)": (24.89, 18.66),
             "Super 35 · 3-perf (24.89 × 14.00)": (24.89, 14.00),
@@ -913,19 +987,17 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             2.0 * math.atan(math.tan(initial_shot_fov_y * 0.5) * initial_shot_aspect)
         )
         shot_duration_default = min(max(args.shot_frames, 2), 600)
-        keyframes = [
-            ShotKeyframe(0, initial_wxyz.copy(), initial_position.copy(), initial_shot_fov_y),
-            ShotKeyframe(
-                shot_duration_default - 1,
-                initial_wxyz.copy(),
-                initial_position.copy(),
-                initial_shot_fov_y,
-            ),
-        ]
+        keyframes: list[ShotKeyframe] = []
         path_handles: list[Any] = []
+        last_path_projection_matches: bool | None = None
         gui_guard = False
         last_shot_aspect = initial_shot_aspect
         last_sensor_dimensions = (sensor_width_default, sensor_height_default)
+        last_camera_pose = (
+            np.asarray(client.camera.wxyz, dtype=np.float64).copy(),
+            np.asarray(client.camera.position, dtype=np.float64).copy(),
+            float(client.camera.fov),
+        )
 
         with client.gui.add_folder("4C4D Playback", expand_by_default=False):
             frame_slider = client.gui.add_slider("Frame", min=0, max=args.frames - 1, step=1, initial_value=args.frame)
@@ -997,24 +1069,31 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             shot_duration = client.gui.add_number("Duration (frames)", initial_value=shot_duration_default, min=2, max=600, step=1)
             shot_frame = client.gui.add_slider("Shot frame", min=0, max=599, step=1, initial_value=0)
             shot_interpolation = client.gui.add_dropdown("Interpolation", ("Smooth ease", "Linear"), initial_value="Smooth ease")
-            preview_shot = client.gui.add_checkbox("Preview camera move", initial_value=False)
+            preview_shot = client.gui.add_checkbox("Play shot timeline", initial_value=False)
+            lock_camera_to_shot = client.gui.add_checkbox("Lock camera to shot", initial_value=False)
             loop_shot = client.gui.add_checkbox("Loop shot", initial_value=True)
-            aspect_preset = client.gui.add_dropdown(
-                "Shot framing", tuple(aspect_options), initial_value=initial_aspect_label
-            )
+            aspect_preset = client.gui.add_dropdown("Shot framing", tuple(aspect_options), initial_value="16:9 · UHD")
             match_preview_aspect = client.gui.add_checkbox("Preview shot gate", initial_value=True)
             matte_opacity = client.gui.add_slider("Outside matte", min=0, max=95, step=5, initial_value=50)
             rule_of_thirds = client.gui.add_checkbox("Rule of thirds", initial_value=False)
             action_safe = client.gui.add_checkbox("Action-safe frame", initial_value=False)
             show_camera_path = client.gui.add_checkbox("Show camera path", initial_value=True)
-            keyframe_select = client.gui.add_dropdown("Keyframes", ("Frame 0", f"Frame {shot_duration_default - 1}"), initial_value="Frame 0")
+            keyframe_select = client.gui.add_dropdown(
+                "Keyframes", ("No keyframes",), initial_value="No keyframes", disabled=True
+            )
             sequencer_data = client.gui.add_text("Sequencer key data", initial_value="{}", disabled=True)
             add_keyframe = client.gui.add_button("Add / update keyframe", color="violet")
             delete_keyframe = client.gui.add_button("Delete selected keyframe")
             export_format = client.gui.add_dropdown("Camera export", ("glTF 2.0", "USD ASCII", "4C4D JSON"), initial_value="glTF 2.0")
             export_camera = client.gui.add_button("Download camera data")
         with client.gui.add_folder("Render & Export", expand_by_default=False):
-            final_width = client.gui.add_number("Output width", initial_value=1920, min=320, max=4096, step=2)
+            final_long_edge = client.gui.add_number(
+                "Output long edge",
+                initial_value=1920,
+                min=320,
+                max=MAX_RENDER_EDGE,
+                step=2,
+            )
             final_resolution = client.gui.add_text("Output resolution", initial_value="1920 × 1080 · 16:9", disabled=True)
             final_fps = client.gui.add_number("Output FPS", initial_value=24, min=1, max=120, step=1)
             final_crf = client.gui.add_slider("H.264 quality (CRF)", min=10, max=35, step=1, initial_value=18)
@@ -1029,11 +1108,17 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         def current_aspect() -> float:
             return aspect_options[str(aspect_preset.value)]
 
+        def camera_follows_shot() -> bool:
+            return (
+                bool(lock_camera_to_shot.value)
+                and bool(keyframes)
+                and state.dynamic_frame_override is not None
+            )
+
         def update_output_resolution() -> None:
-            width = max(2, int(final_width.value))
-            width -= width % 2
-            height = max(2, int(round(width / current_aspect())))
-            height -= height % 2
+            width, height = render_resolution_for_long_edge(
+                int(final_long_edge.value), current_aspect()
+            )
             final_resolution.value = f"{width} × {height} · {aspect_preset.value}"
 
         def shot_length() -> int:
@@ -1088,7 +1173,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             )
 
         def sync_camera_gui() -> None:
-            nonlocal gui_guard
+            nonlocal gui_guard, last_camera_pose
             gui_guard = True
             try:
                 camera_position.value = tuple(float(value) for value in client.camera.position)
@@ -1137,15 +1222,24 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
                 )
                 update_coordinate_text()
+                last_camera_pose = (
+                    np.asarray(client.camera.wxyz, dtype=np.float64).copy(),
+                    np.asarray(client.camera.position, dtype=np.float64).copy(),
+                    float(client.camera.fov),
+                )
             finally:
                 gui_guard = False
 
         def refresh_keyframe_gui() -> None:
             ordered = sorted(keyframes, key=lambda item: item.shot_frame)
-            labels = tuple(f"Frame {key.shot_frame}" for key in ordered)
+            labels = tuple(f"Frame {key.shot_frame}" for key in ordered) or ("No keyframes",)
             keyframe_select.options = labels
-            selected = f"Frame {int(shot_frame.value)}"
-            keyframe_select.value = selected if selected in labels else labels[0]
+            keyframe_select.disabled = not ordered
+            if ordered:
+                selected = f"Frame {int(shot_frame.value)}"
+                keyframe_select.value = selected if selected in labels else labels[0]
+            else:
+                keyframe_select.value = "No keyframes"
             sequencer_data.value = json.dumps(
                 {
                     "keys": [
@@ -1165,11 +1259,32 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 separators=(",", ":"),
             )
 
+        def camera_path_projection_matches() -> bool:
+            canvas_width = max(int(client.camera.image_width), 1)
+            canvas_height = max(int(client.camera.image_height), 1)
+            canvas_aspect = (
+                float(client.camera.aspect)
+                if float(client.camera.aspect) > 0
+                else canvas_width / canvas_height
+            )
+            return preview_projection_matches_scene(
+                float(client.camera.fov),
+                canvas_aspect,
+                current_aspect(),
+                bool(match_preview_aspect.value),
+            )
+
         def refresh_camera_path() -> None:
+            nonlocal last_path_projection_matches
             for handle in path_handles:
                 handle.remove()
             path_handles.clear()
-            if not bool(show_camera_path.value) or not keyframes:
+            last_path_projection_matches = camera_path_projection_matches()
+            if (
+                not bool(show_camera_path.value)
+                or not keyframes
+                or not last_path_projection_matches
+            ):
                 return
             ordered = sorted(keyframes, key=lambda item: item.shot_frame)
             if len(ordered) > 1:
@@ -1240,16 +1355,35 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             )
 
         def request_render(_: Any = None) -> None:
-            timestamp_text.value = f"{frame_to_timestamp(int(frame_slider.value), args.frames, time_duration):.4f}"
+            rendered_frame = (
+                state.dynamic_frame_override
+                if state.dynamic_frame_override is not None
+                else float(frame_slider.value)
+            )
+            timestamp_text.value = f"{frame_to_timestamp(rendered_frame, args.frames, time_duration):.4f}"
             with state.lock:
                 state.snapshot = capture_snapshot()
             state.dirty.set()
 
+        def commit_manual_camera_edit() -> None:
+            lock_camera_to_shot.value = False
+            sync_camera_gui()
+            request_render()
+
         @client.camera.on_update
         def _(_: Any) -> None:
+            previous_wxyz, previous_position, previous_fov = last_camera_pose
+            pose_changed = (
+                not np.allclose(client.camera.wxyz, previous_wxyz, atol=1e-7, rtol=1e-7)
+                or not np.allclose(client.camera.position, previous_position, atol=1e-7, rtol=1e-7)
+                or not math.isclose(float(client.camera.fov), previous_fov, abs_tol=1e-7, rel_tol=1e-7)
+            )
+            if not gui_guard and pose_changed:
+                lock_camera_to_shot.value = False
             if not gui_guard:
-                state.dynamic_frame_override = None
                 sync_camera_gui()
+            if camera_path_projection_matches() != last_path_projection_matches:
+                refresh_camera_path()
             request_render()
 
         @frame_slider.on_update
@@ -1258,7 +1392,10 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 state.dynamic_frame_override = None
             request_render()
         render_width.on_update(request_render)
-        match_preview_aspect.on_update(request_render)
+        @match_preview_aspect.on_update
+        def _(_: Any) -> None:
+            refresh_camera_path()
+            request_render()
         matte_opacity.on_update(request_render)
         rule_of_thirds.on_update(request_render)
         action_safe.on_update(request_render)
@@ -1273,19 +1410,21 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             if gui_guard:
                 return
             client.camera.position = np.asarray(camera_position.value, dtype=np.float64)
+            commit_manual_camera_edit()
 
         @camera_rotation.on_update
         def _(_: Any) -> None:
             if gui_guard:
                 return
             client.camera.wxyz = euler_xyz_degrees_to_quaternion(np.asarray(camera_rotation.value, dtype=np.float64))
+            commit_manual_camera_edit()
 
         @filmback_lens.on_update
         def _(_: Any) -> None:
             nonlocal gui_guard
             if gui_guard:
                 return
-            following_shot = state.dynamic_frame_override is not None
+            following_shot = camera_follows_shot()
             sensor_width_mm, sensor_height_mm, focal_mm = lens_values()
             sensor_changed = remap_keyframes_for_sensor(sensor_width_mm, sensor_height_mm)
             preset = sensor_presets[str(sensor_preset.value)]
@@ -1303,7 +1442,10 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 client.camera.fov = focal_length_to_shot_fov_y(
                     focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
                 )
+                commit_manual_camera_edit()
             refresh_keyframe_gui()
+            if sensor_changed:
+                refresh_camera_path()
 
         @field_of_view.on_update
         def _(_: Any) -> None:
@@ -1324,6 +1466,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 )
             else:
                 client.camera.fov = math.radians(float(requested[0]))
+            commit_manual_camera_edit()
 
         @equivalent_focal.on_update
         def _(_: Any) -> None:
@@ -1351,6 +1494,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             client.camera.fov = focal_length_to_shot_fov_y(
                 focal_mm, sensor_width_mm, sensor_height_mm, current_aspect()
             )
+            commit_manual_camera_edit()
 
         @sensor_preset.on_update
         def _(_: Any) -> None:
@@ -1358,7 +1502,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             preset = sensor_presets[str(sensor_preset.value)]
             if preset is None or gui_guard:
                 return
-            following_shot = state.dynamic_frame_override is not None
+            following_shot = camera_follows_shot()
             _, _, current_focal = lens_values()
             remap_keyframes_for_sensor(preset[0], preset[1])
             gui_guard = True
@@ -1372,11 +1516,38 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 client.camera.fov = focal_length_to_shot_fov_y(
                     current_focal, preset[0], preset[1], current_aspect()
                 )
+                commit_manual_camera_edit()
             refresh_keyframe_gui()
+            refresh_camera_path()
 
         @toggle_playback.on_trigger
         def _(_: Any) -> None:
-            play.value = not bool(play.value)
+            next_value = not bool(play.value)
+            if next_value:
+                preview_shot.value = False
+            play.value = next_value
+
+        @play.on_update
+        def _(_: Any) -> None:
+            if bool(play.value):
+                preview_shot.value = False
+
+        @preview_shot.on_update
+        def _(_: Any) -> None:
+            if bool(preview_shot.value):
+                play.value = False
+
+        @lock_camera_to_shot.on_update
+        def _(_: Any) -> None:
+            if bool(lock_camera_to_shot.value):
+                apply_shot_frame(float(shot_frame.value))
+                final_status.value = (
+                    "Camera locked to keyed shot"
+                    if keyframes
+                    else "Camera lock armed · add a keyframe to create a shot"
+                )
+            else:
+                final_status.value = "Camera unlocked for free navigation"
 
         @snap_button.on_click
         def _(_: Any) -> None:
@@ -1386,21 +1557,31 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                 client.camera.wxyz = wxyz
                 client.camera.position = position
                 client.camera.fov = reference.fov_y
-            request_render()
+            commit_manual_camera_edit()
 
         def apply_shot_frame(target_frame: float) -> None:
             nonlocal gui_guard
-            key = interpolate_keyframes(keyframes, target_frame, str(shot_interpolation.value) == "Smooth ease")
+            key = (
+                interpolate_keyframes(
+                    keyframes,
+                    target_frame,
+                    str(shot_interpolation.value) == "Smooth ease",
+                )
+                if keyframes
+                else None
+            )
             dynamic_frame = scene_frame_for_shot(target_frame, float(final_fps.value), args.frames, time_duration)
             state.dynamic_frame_override = dynamic_frame
             gui_guard = True
             try:
                 with client.atomic():
-                    client.camera.wxyz = key.wxyz
-                    client.camera.position = key.position
-                    client.camera.fov = key.fov_y
+                    if bool(lock_camera_to_shot.value) and key is not None:
+                        client.camera.wxyz = key.wxyz
+                        client.camera.position = key.position
+                        client.camera.fov = key.fov_y
                     frame_slider.value = int(round(dynamic_frame))
-                sync_camera_gui()
+                if bool(lock_camera_to_shot.value) and key is not None:
+                    sync_camera_gui()
             finally:
                 gui_guard = False
             request_render()
@@ -1417,15 +1598,18 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         @shot_duration.on_update
         def _(_: Any) -> None:
             last_frame = shot_length() - 1
-            for key in keyframes:
-                key.shot_frame = min(key.shot_frame, last_frame)
-            deduplicated: dict[int, ShotKeyframe] = {key.shot_frame: key for key in keyframes}
-            keyframes[:] = sorted(deduplicated.values(), key=lambda key: key.shot_frame)
-            if int(shot_frame.value) >= shot_length():
+            keyframes[:] = trim_keyframes_to_duration(
+                keyframes,
+                shot_length(),
+                str(shot_interpolation.value) == "Smooth ease",
+            )
+            playhead_clipped = int(shot_frame.value) >= shot_length()
+            if playhead_clipped:
                 shot_frame.value = last_frame
             refresh_keyframe_gui()
             refresh_camera_path()
-            apply_shot_frame(int(shot_frame.value))
+            if playhead_clipped or state.dynamic_frame_override is not None:
+                apply_shot_frame(int(shot_frame.value))
 
         @add_keyframe.on_click
         def _(_: Any) -> None:
@@ -1457,9 +1641,6 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         @delete_keyframe.on_click
         def _(_: Any) -> None:
-            if len(keyframes) <= 1:
-                final_status.value = "A shot must keep at least one keyframe"
-                return
             selected_frame = int(shot_frame.value)
             if not any(key.shot_frame == selected_frame for key in keyframes):
                 final_status.value = f"No camera keyframe at frame {selected_frame}"
@@ -1467,6 +1648,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             keyframes[:] = [key for key in keyframes if key.shot_frame != selected_frame]
             refresh_keyframe_gui()
             refresh_camera_path()
+            apply_shot_frame(selected_frame)
             final_status.value = f"Deleted camera keyframe {selected_frame}"
 
         show_camera_path.on_update(lambda _: refresh_camera_path())
@@ -1485,7 +1667,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         @aspect_preset.on_update
         def _(_: Any) -> None:
             nonlocal gui_guard, last_shot_aspect
-            following_shot = state.dynamic_frame_override is not None
+            following_shot = camera_follows_shot()
             new_aspect = current_aspect()
             sensor_width_mm, sensor_height_mm, _ = lens_values()
             current_focal = shot_fov_y_to_focal_length(
@@ -1515,7 +1697,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             update_output_resolution()
             request_render()
 
-        final_width.on_update(lambda _: update_output_resolution())
+        final_long_edge.on_update(lambda _: update_output_resolution())
 
         def camera_export(
             selected_format: str | None = None,
@@ -1579,6 +1761,9 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
 
         @export_camera.on_click
         def _(_: Any) -> None:
+            if not keyframes:
+                final_status.value = "Add a camera keyframe before exporting"
+                return
             filename, content = camera_export()
             client.send_file_download(filename, content, save_immediately=True)
             final_status.value = f"Downloaded {filename}"
@@ -1587,8 +1772,8 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
         def _(_: Any) -> None:
             if state.final_rendering:
                 return
-            if len(keyframes) < 2:
-                final_status.value = "Add at least two camera keyframes before rendering"
+            if not keyframes:
+                final_status.value = "Add a camera keyframe before rendering"
                 return
             state.final_rendering = True
             state.render_cancel.clear()
@@ -1604,7 +1789,7 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
             render_settings = {
                 "duration": shot_length(),
                 "fps": int(final_fps.value),
-                "width": int(final_width.value),
+                "long_edge": int(final_long_edge.value),
                 "aspect": current_aspect(),
                 "interpolation": str(shot_interpolation.value),
                 "crf": int(final_crf.value),
@@ -1628,30 +1813,30 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                             final_progress.value = progress * 100.0
                             final_status.value = f"Rendering {completed} / {render_settings['duration']} frames"
 
-                        with render_lock:
-                            render_shot_mp4(
-                                model=model,
-                                pipe=pipe,
-                                keyframes=copied_keys,
-                                duration_frames=int(render_settings["duration"]),
-                                fps=int(render_settings["fps"]),
-                                width=int(render_settings["width"]),
-                                aspect=float(render_settings["aspect"]),
-                                interpolation=str(render_settings["interpolation"]),
-                                num_scene_frames=args.frames,
-                                time_duration=time_duration,
-                                white_background=args.white_background,
-                                crf=int(render_settings["crf"]),
-                                output_path=output_path,
-                                progress_callback=update_progress,
-                                cancelled=state.render_cancel,
-                            )
+                        render_shot_mp4(
+                            model=model,
+                            pipe=pipe,
+                            keyframes=copied_keys,
+                            duration_frames=int(render_settings["duration"]),
+                            fps=int(render_settings["fps"]),
+                            long_edge=int(render_settings["long_edge"]),
+                            aspect=float(render_settings["aspect"]),
+                            interpolation=str(render_settings["interpolation"]),
+                            num_scene_frames=args.frames,
+                            time_duration=time_duration,
+                            white_background=args.white_background,
+                            crf=int(render_settings["crf"]),
+                            output_path=output_path,
+                            progress_callback=update_progress,
+                            cancelled=state.render_cancel,
+                            render_lock=render_lock,
+                        )
                         output_size = output_path.stat().st_size
                         max_download_size = 256 * 1024 * 1024
                         if output_size > max_download_size:
                             raise RuntimeError(
                                 f"MP4 is {output_size / (1024 * 1024):.1f} MiB; "
-                                "the browser download limit is 256 MiB. Lower output width or raise CRF."
+                                "the browser download limit is 256 MiB. Lower the output long edge or raise CRF."
                             )
                         client.send_file_download(output_path.name, output_path.read_bytes(), save_immediately=True)
                         if str(render_settings["sidecar"]) != "None":
@@ -1720,28 +1905,75 @@ def run_server(args: argparse.Namespace, model: Any, pipe: Any, iteration: int, 
                     print(f"Render failed for client {client.client_id}: {exc}", flush=True)
 
         def playback_worker() -> None:
+            shot_started_at: float | None = None
+            shot_started_frame = 0
+            shot_schedule_fps = 0
+            shot_schedule_duration = 0
+            shot_schedule_loop = False
+            last_scheduled_frame = -1
             while state.alive:
                 if bool(preview_shot.value):
-                    state.shot_playing = True
-                    next_frame = int(shot_frame.value) + 1
-                    if next_frame >= shot_length():
-                        if bool(loop_shot.value):
-                            next_frame = 0
-                        else:
-                            preview_shot.value = False
-                            state.shot_playing = False
-                            continue
-                    shot_frame.value = next_frame
-                    apply_shot_frame(next_frame)
-                    time.sleep(1.0 / max(int(final_fps.value), 1))
+                    now = time.monotonic()
+                    playback_fps = max(int(final_fps.value), 1)
+                    playback_duration = shot_length()
+                    playback_loop = bool(loop_shot.value)
+                    live_frame = int(shot_frame.value)
+                    if (
+                        not state.shot_playing
+                        or shot_started_at is None
+                        or shot_playback_config_changed(
+                            shot_schedule_fps,
+                            shot_schedule_duration,
+                            shot_schedule_loop,
+                            playback_fps,
+                            playback_duration,
+                            playback_loop,
+                        )
+                        or shot_playback_needs_rebase(
+                            state.shot_playing,
+                            live_frame,
+                            last_scheduled_frame,
+                        )
+                    ):
+                        state.shot_playing = True
+                        shot_started_at = now
+                        shot_started_frame = live_frame
+                        shot_schedule_fps = playback_fps
+                        shot_schedule_duration = playback_duration
+                        shot_schedule_loop = playback_loop
+                        last_scheduled_frame = shot_started_frame
+                    next_frame, finished = scheduled_shot_frame(
+                        shot_started_frame,
+                        now - shot_started_at,
+                        shot_schedule_fps,
+                        shot_schedule_duration,
+                        shot_schedule_loop,
+                    )
+                    if next_frame != last_scheduled_frame:
+                        shot_frame.value = next_frame
+                        apply_shot_frame(next_frame)
+                        last_scheduled_frame = next_frame
+                    if finished:
+                        preview_shot.value = False
+                        state.shot_playing = False
+                        shot_started_at = None
+                        continue
+                    elapsed_frames = max(
+                        int(math.floor((now - shot_started_at) * shot_schedule_fps + 1e-9)),
+                        0,
+                    )
+                    next_deadline = shot_started_at + (elapsed_frames + 1) / shot_schedule_fps
+                    time.sleep(max(next_deadline - time.monotonic(), 0.001))
                 elif bool(play.value):
                     state.shot_playing = False
+                    shot_started_at = None
                     state.dynamic_frame_override = None
                     frame_slider.value = (int(frame_slider.value) + 1) % args.frames
                     request_render()
                     time.sleep(1.0 / max(int(fps.value), 1))
                 else:
                     state.shot_playing = False
+                    shot_started_at = None
                     time.sleep(0.05)
 
         threading.Thread(target=render_worker, daemon=True, name=f"4c4d-render-{client.client_id}").start()
@@ -1783,16 +2015,12 @@ def self_test() -> None:
     c2w_cv[:3, 3] = [1.0, 2.0, 3.0]
     wxyz, position = opencv_c2w_to_viser(c2w_cv)
     np.testing.assert_allclose(opengl_c2w_to_opencv_c2w(wxyz, position), c2w_cv, atol=1e-7)
-    reference = ReferenceCamera("cam00", 2560, 1440, 1500.0, 1490.0, np.eye(4))
-    upright = reference.rotated_ccw(90)
-    assert (upright.width, upright.height, upright.fx, upright.fy) == (1440, 2560, 1490.0, 1500.0)
-    np.testing.assert_allclose(
-        upright.c2w_cv[:3, :3],
-        np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
-        atol=1e-7,
-    )
     assert frame_to_timestamp(0, 300, (0.0, 10.0)) == 0.0
     assert math.isclose(frame_to_timestamp(299, 300, (0.0, 10.0)), 299.0 / 30.0)
+    assert math.isclose(frame_to_timestamp(1.25, 300, (0.0, 10.0)), 1.25 / 30.0)
+    assert render_resolution_for_long_edge(4096, 16.0 / 9.0) == (4096, 2304)
+    assert render_resolution_for_long_edge(4096, 9.0 / 16.0) == (2304, 4096)
+    assert render_resolution_for_long_edge(8192, 9.0 / 16.0) == (2304, 4096)
     assert math.isclose(
         full_frame_equivalent_to_focal_length(50.0, 24.89, 18.66, 16.0 / 9.0),
         34.5694444444,
@@ -1828,6 +2056,20 @@ def self_test() -> None:
         )
     assert math.isclose(preview_fov_y_for_gate(test_shot_fov, 2.0, 16.0 / 9.0), test_shot_fov)
     assert preview_fov_y_for_gate(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0) > test_shot_fov
+    assert preview_projection_matches_scene(test_shot_fov, 2.0, 16.0 / 9.0, True)
+    assert not preview_projection_matches_scene(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0, True)
+    assert preview_projection_matches_scene(test_shot_fov, 4.0 / 3.0, 16.0 / 9.0, False)
+    assert scheduled_shot_frame(0, 0.0, 24, 48, False) == (0, False)
+    assert scheduled_shot_frame(0, 0.5, 24, 48, False) == (12, False)
+    assert scheduled_shot_frame(47, 1.0 / 24.0, 24, 48, False) == (47, True)
+    assert scheduled_shot_frame(47, 1.0 / 24.0, 24, 48, True) == (0, False)
+    assert not shot_playback_needs_rebase(False, 12, 8)
+    assert not shot_playback_needs_rebase(True, 12, 12)
+    assert shot_playback_needs_rebase(True, 18, 12)
+    assert not shot_playback_config_changed(24, 120, True, 24, 120, True)
+    assert shot_playback_config_changed(24, 120, True, 30, 120, True)
+    assert shot_playback_config_changed(24, 120, True, 24, 90, True)
+    assert shot_playback_config_changed(24, 120, True, 24, 120, False)
     euler = np.array([12.0, -24.0, 5.0])
     euler_round_trip = rotation_matrix_to_euler_xyz_degrees(
         quaternion_wxyz_to_matrix(euler_xyz_degrees_to_quaternion(euler))
@@ -1839,6 +2081,21 @@ def self_test() -> None:
     ]
     midpoint = interpolate_keyframes(test_keys, 12, smooth=False)
     np.testing.assert_allclose(midpoint.position, [1.0, 0.5, 0.0])
+    trim_test_keys = [
+        ShotKeyframe(0, test_keys[0].wxyz, np.array([0.0, 0.0, 0.0]), math.radians(40.0)),
+        ShotKeyframe(100, test_keys[0].wxyz, np.array([10.0, 0.0, 0.0]), math.radians(50.0)),
+        ShotKeyframe(119, test_keys[0].wxyz, np.array([50.0, 0.0, 0.0]), math.radians(80.0)),
+    ]
+    trimmed_keys = trim_keyframes_to_duration(trim_test_keys, 101, smooth=False)
+    assert [key.shot_frame for key in trimmed_keys] == [0, 100]
+    np.testing.assert_allclose(trimmed_keys[-1].position, [10.0, 0.0, 0.0])
+    assert math.isclose(trimmed_keys[-1].fov_y, math.radians(50.0))
+    interpolated_trim = trim_keyframes_to_duration(trim_test_keys, 51, smooth=False)
+    assert [key.shot_frame for key in interpolated_trim] == [0, 50]
+    np.testing.assert_allclose(interpolated_trim[-1].position, [5.0, 0.0, 0.0])
+    assert math.isclose(interpolated_trim[-1].fov_y, math.radians(45.0))
+    static_hold = interpolate_keyframes([test_keys[0]], 12, smooth=True)
+    np.testing.assert_allclose(static_hold.position, test_keys[0].position)
     assert scene_frame_for_shot(12, 24, 300, (0.0, 10.0)) == 15.0
     smooth_export = export_keyframes(test_keys, 30, smooth=True)
     assert len(smooth_export) == 30 and smooth_export[-1].shot_frame == 29
@@ -1863,6 +2120,7 @@ def self_test() -> None:
     assert math.isclose(gltf["cameras"][0]["perspective"]["aspectRatio"], 16.0 / 9.0)
     assert gltf["nodes"][0]["children"] == [1]
     assert gltf["animations"][0]["channels"][0]["target"]["node"] == 1
+    assert gltf["animations"][0]["channels"][2]["target"]["path"] == "pointer"
     assert (
         gltf["animations"][0]["channels"][2]["target"]["extensions"]["KHR_animation_pointer"]["pointer"]
         == "/cameras/0/perspective/yfov"
@@ -1901,13 +2159,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cameras-json", type=Path, default=None)
     parser.add_argument("--training-views", default="1,10,13,20")
     parser.add_argument("--initial-camera", default="cam10")
-    parser.add_argument(
-        "--camera-rotation-ccw",
-        type=int,
-        choices=(0, 90, 180, 270),
-        default=0,
-        help="Display correction for source images stored with camera roll",
-    )
     parser.add_argument("--frames", type=int, default=300)
     parser.add_argument("--frame", type=int, default=150)
     parser.add_argument("--fps", type=int, default=30)
@@ -1934,11 +2185,6 @@ def main() -> None:
     args.cameras_json = args.cameras_json or args.checkpoint.parent / "cameras.json"
     training_views = [int(value) for value in args.training_views.split(",") if value.strip()]
     references = load_reference_cameras(args.cameras_json, training_views)
-    if args.camera_rotation_ccw:
-        references = {
-            name: reference.rotated_ccw(args.camera_rotation_ccw)
-            for name, reference in references.items()
-        }
     model, pipe, iteration, time_duration = load_model(args.config, args.checkpoint)
     run_server(args, model, pipe, iteration, time_duration, references)
 

@@ -198,13 +198,6 @@ python viewer_4c4d.py \
   --port 8080
 ```
 
-For captures whose RGB sensors were physically rolled but whose stored rasters
-were intentionally left unchanged, add `--camera-rotation-ccw 90` (or 180/270).
-The viewer applies the matching camera roll, swaps the focal axes and image
-dimensions for quarter turns, and chooses the closest cinematic shot gate. This
-is a display correction for an existing checkpoint; preprocessing an upright
-dataset requires rotating the raster, intrinsics, and camera pose together.
-
 Open `http://localhost:8080` on the same machine. This also works when the
 server runs in WSL2 and the browser runs on Windows. Use `--width` to trade
 interactive resolution for frame rate. Space toggles playback. The bundled
@@ -213,9 +206,14 @@ X/Y orbit and move inversion settings.
 
 The **Cinematic Shot** panel turns the free camera into a shot camera. Set the
 shot cursor, navigate or enter an exact XYZ/Euler pose, choose the lens, then
-select **Add / update keyframe**. Scrubbing or enabling **Preview camera move**
-evaluates the interpolated camera path while the dynamic splat advances with
-the same elapsed timeline time.
+select **Add / update keyframe**. New shots start empty with no automatic
+camera keys, and the final key can be deleted to return to that blank state.
+Scrubbing or enabling **Play shot timeline**
+advances the dynamic splat with the same elapsed timeline time. The sequencer
+camera lock is off by default, allowing free viewport navigation during
+playback; enable **Lock camera to shot** (or press **L** over the sequencer) to
+preview the interpolated keyed camera move. Unlocking leaves the camera free
+while the playhead and dynamic splat continue playing.
 The viewport can show the 3D path, key-camera frustums, rule-of-thirds guides,
 an action-safe frame, and common cinematic aspect ratios.
 The docked cinematic sequencer provides a frame ruler, draggable playhead,

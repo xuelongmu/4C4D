@@ -12,7 +12,8 @@ The customized controls include:
 - independent, persistent X/Y move inversion;
 - Space playback and the viewer's keyboard direction mappings;
 - a cinematic sequencer with shot scrubbing, transport controls, key
-  navigation, camera/lens tracks, and shot-synchronized dynamic playback;
+  navigation, camera/lens tracks, an unlocked-by-default camera-follow toggle,
+  and shot-synchronized dynamic playback;
 - a persistent light/dark UI theme toggle.
 - a wider, collapsible navigation-control palette that stays clear of the
   cinematic sequencer.

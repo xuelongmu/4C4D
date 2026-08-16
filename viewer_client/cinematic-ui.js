@@ -8,6 +8,8 @@
     previous: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m10.5 4.5-7 5.5 7 5.5Z"/><path d="m15.5 6.5 3.5 3.5-3.5 3.5L12 10Z"/></svg>',
     play: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 4.5 9 5.5-9 5.5Z"/></svg>',
     pause: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 5v10M13 5v10"/></svg>',
+    lock: '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4.5" y="9" width="11" height="8" rx="1.5"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>',
+    unlock: '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4.5" y="9" width="11" height="8" rx="1.5"/><path d="M13 9V6.5a3 3 0 0 0-5.7-1.3"/></svg>',
     next: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m9.5 4.5 7 5.5-7 5.5Z"/><path d="m4.5 6.5 3.5 3.5-3.5 3.5L1 10Z"/></svg>',
     end: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16 4v12M5 4.5l7.5 5.5L5 15.5Z"/></svg>',
     addKey: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 5 5 5-5 5-5-5Z"/><path d="M15 6v8M11 10h8"/></svg>',
@@ -162,7 +164,8 @@
         <span class="c4d-seq-shot" id="c4d-seq-shot">shot_001</span>
         <button type="button" class="c4d-seq-button" id="c4d-seq-start" aria-label="Go to shot start" title="Go to shot start">${icons.start}</button>
         <button type="button" class="c4d-seq-button" id="c4d-seq-prev" aria-label="Previous keyframe" title="Previous keyframe">${icons.previous}</button>
-        <button type="button" class="c4d-seq-button" id="c4d-seq-play" aria-label="Play camera shot" title="Play camera shot">${icons.play}</button>
+        <button type="button" class="c4d-seq-button" id="c4d-seq-play" aria-label="Play shot timeline" title="Play shot timeline">${icons.play}</button>
+        <button type="button" class="c4d-seq-button" id="c4d-seq-camera-lock" aria-label="Lock camera to keyed shot" title="Lock camera to keyed shot (L)">${icons.unlock}</button>
         <button type="button" class="c4d-seq-button" id="c4d-seq-next" aria-label="Next keyframe" title="Next keyframe">${icons.next}</button>
         <button type="button" class="c4d-seq-button" id="c4d-seq-end" aria-label="Go to shot end" title="Go to shot end">${icons.end}</button>
         <span class="c4d-seq-timecode" id="c4d-seq-timecode">00:00:00:00</span>
@@ -216,7 +219,8 @@
     document.getElementById("c4d-seq-end").addEventListener("click", () => setFrame(duration - 1));
     document.getElementById("c4d-seq-prev").addEventListener("click", () => setFrame(nearestKey(-1)));
     document.getElementById("c4d-seq-next").addEventListener("click", () => setFrame(nearestKey(1)));
-    document.getElementById("c4d-seq-play").addEventListener("click", () => controlForLabel("Preview camera move", "checkbox")?.click());
+    document.getElementById("c4d-seq-play").addEventListener("click", () => controlForLabel("Play shot timeline", "checkbox")?.click());
+    document.getElementById("c4d-seq-camera-lock").addEventListener("click", () => controlForLabel("Lock camera to shot", "checkbox")?.click());
     document.getElementById("c4d-seq-add").addEventListener("click", () => buttonWithText("Add / update keyframe")?.click());
     document.getElementById("c4d-seq-delete").addEventListener("click", () => buttonWithText("Delete selected keyframe")?.click());
     document.getElementById("c4d-seq-theme").addEventListener("click", () => {
@@ -248,16 +252,25 @@
       if (lanes.hasPointerCapture(event.pointerId)) lanes.releasePointerCapture(event.pointerId);
     });
 
-    root.addEventListener("keydown", (event) => {
-      if (event.target.matches("input, textarea, select")) return;
+    let sequencerHovered = false;
+    root.addEventListener("pointerenter", () => { sequencerHovered = true; });
+    root.addEventListener("pointerleave", () => { sequencerHovered = false; });
+    document.addEventListener("keydown", (event) => {
+      if (!sequencerHovered && !root.contains(document.activeElement)) return;
+      if (event.target instanceof Element && event.target.matches("input, textarea, select")) return;
+      if (event.repeat) return;
       if (event.code === "Space") {
         event.preventDefault();
-        controlForLabel("Preview camera move", "checkbox")?.click();
+        event.stopPropagation();
+        controlForLabel("Play shot timeline", "checkbox")?.click();
       } else if (event.key.toLowerCase() === "k") {
         event.preventDefault();
         buttonWithText("Add / update keyframe")?.click();
+      } else if (event.key.toLowerCase() === "l") {
+        event.preventDefault();
+        controlForLabel("Lock camera to shot", "checkbox")?.click();
       }
-    });
+    }, true);
 
     const renderTracks = () => {
       const ruler = document.getElementById("c4d-seq-ruler");
@@ -329,10 +342,20 @@
       root.querySelectorAll(".c4d-seq-key").forEach((marker) => {
         marker.classList.toggle("c4d-seq-selected", Number(marker.dataset.frame) === currentFrame);
       });
-      const playing = Boolean(controlForLabel("Preview camera move", "checkbox")?.checked);
+      const playing = Boolean(controlForLabel("Play shot timeline", "checkbox")?.checked);
       const playButton = document.getElementById("c4d-seq-play");
       playButton.classList.toggle("c4d-seq-active", playing);
       setIcon(playButton, playing ? "pause" : "play");
+      const playAction = playing ? "Pause shot timeline" : "Play shot timeline";
+      playButton.setAttribute("aria-label", playAction);
+      playButton.title = playAction;
+      const cameraLocked = Boolean(controlForLabel("Lock camera to shot", "checkbox")?.checked);
+      const lockButton = document.getElementById("c4d-seq-camera-lock");
+      lockButton.classList.toggle("c4d-seq-active", cameraLocked);
+      setIcon(lockButton, cameraLocked ? "lock" : "unlock");
+      const lockAction = cameraLocked ? "Unlock camera for free navigation" : "Lock camera to keyed shot";
+      lockButton.setAttribute("aria-label", lockAction);
+      lockButton.title = `${lockAction} (L)`;
       window.setTimeout(poll, 90);
     };
     poll();
