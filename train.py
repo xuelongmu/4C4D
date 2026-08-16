@@ -15,7 +15,8 @@ os.environ["TORCH_USE_CUDA_DSA"] = "1"
 import random
 import torch
 from torch import nn
-from utils.loss_utils import l1_loss #, ssim, msssim
+from utils.loss_utils import l1_loss, patchwise_pearson_depth_loss #, ssim, msssim
+from utils.depth_priors import load_depth_priors
 from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
@@ -130,6 +131,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         color_affine_optimizer = torch.optim.AdamW(
             [color_affine_delta], lr=args.color_affine_lr, weight_decay=args.color_affine_weight_decay)
         color_affine_eye = torch.eye(3, 4, device="cuda")
+    # Depth priors for --depth_supervision. Held on the GPU for the whole run:
+    # the static MASt3R maps are one per camera, so this is tens of MB even
+    # though every frame of that camera references one.
+    depth_priors = None
+    if args.depth_supervision:
+        prior_dir = args.depth_prior_dir or os.path.join(dataset.source_path, "depth_priors")
+        depth_priors = load_depth_priors(prior_dir, training_dataset.viewpoint_stack)
+
     if dataset.dataloader:
         print("\nUsing DataLoader for training dataset")
     else:
@@ -212,7 +221,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 Ll1 = l1_loss(image_for_loss, gt_image)
                 Lssim = 1.0 - fast_ssim(image_for_loss.unsqueeze(0), gt_image.unsqueeze(0))
                 loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim
-                    
+
+                # Scale-invariant depth supervision (issue #19). The prior only
+                # has to be right up to a per-patch affine, so it can constrain
+                # sparse-view geometry without being metrically consistent with
+                # the reconstruction.
+                Ldepth = None
+                if depth_priors is not None and iteration <= args.depth_supervision_until:
+                    prior = depth_priors.get(viewpoint_cam.image_name)
+                    if prior is not None:
+                        prior_depth, prior_valid = prior
+                        # The rasterizer accumulates D += d*alpha*T without
+                        # normalizing, so a half-covered pixel reports half its
+                        # depth. Divide by alpha to get expected depth, and drop
+                        # pixels too transparent for that quotient to mean
+                        # anything.
+                        alpha = render_pkg["alpha"]
+                        depth = render_pkg["depth"] / alpha.clamp_min(1e-6)
+                        Ldepth = patchwise_pearson_depth_loss(
+                            depth, prior_depth,
+                            prior_valid & (alpha.squeeze(0) > args.depth_alpha_threshold),
+                            patch_size=args.depth_patch_size)
+                        loss = loss + args.lambda_depth * Ldepth
+
                 loss = loss / batch_size
                 loss.backward()
                 
@@ -256,7 +287,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             if iteration % 100 == 0:
                 iter_end.record()
-            loss_dict = {"Ll1": Ll1, "Lssim": Lssim}
+            loss_dict = {"Ll1": Ll1, "Lssim": Lssim, "Ldepth": Ldepth}
 
             with torch.no_grad():
                 if iteration % 10 == 0:
@@ -405,6 +436,8 @@ def training_report(tb_writer, iteration, Ll1, Lssim, loss, l1_loss, elapsed, te
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/ssim_loss', Lssim.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        if loss_dict is not None and loss_dict.get("Ldepth") is not None:
+            tb_writer.add_scalar('train_loss_patches/depth_loss', loss_dict["Ldepth"].item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
         tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
 
@@ -531,6 +564,20 @@ if __name__ == "__main__":
                         help='decode all training images once and keep them as uint8 on the GPU')
     parser.add_argument('--freeze_static_temporal', action=BooleanOptionalAction, default=False,
                         help='zero temporal gradients of gaussians whose support spans the whole clip')
+    parser.add_argument('--depth_supervision', action=BooleanOptionalAction, default=False,
+                        help='add a scale-invariant patch-wise Pearson loss between rendered depth '
+                             'and a precomputed depth prior (issue #19)')
+    parser.add_argument('--depth_prior_dir', type=str, default='',
+                        help='directory of <cam>.npz / <cam>_<frame>.npz depth priors '
+                             '(default: <source_path>/depth_priors)')
+    parser.add_argument('--lambda_depth', type=float, default=0.05,
+                        help='weight of the depth supervision term')
+    parser.add_argument('--depth_patch_size', type=int, default=32,
+                        help='side of the non-overlapping patches the Pearson correlation is computed over')
+    parser.add_argument('--depth_alpha_threshold', type=float, default=0.5,
+                        help='ignore rendered pixels whose accumulated alpha is below this')
+    parser.add_argument('--depth_supervision_until', type=int, default=int(1e9),
+                        help='stop applying depth supervision after this iteration')
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
