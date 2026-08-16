@@ -198,6 +198,13 @@ python viewer_4c4d.py \
   --port 8080
 ```
 
+For captures whose RGB sensors were physically rolled but whose stored rasters
+were intentionally left unchanged, add `--camera-rotation-ccw 90` (or 180/270).
+The viewer applies the matching camera roll, swaps the focal axes and image
+dimensions for quarter turns, and chooses the closest cinematic shot gate. This
+is a display correction for an existing checkpoint; preprocessing an upright
+dataset requires rotating the raster, intrinsics, and camera pose together.
+
 Open `http://localhost:8080` on the same machine. This also works when the
 server runs in WSL2 and the browser runs on Windows. Use `--width` to trade
 interactive resolution for frame rate. Space toggles playback. The bundled
