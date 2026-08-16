@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 import warnings
 from pathlib import Path
 
@@ -42,19 +44,32 @@ def read_cameras(path: Path) -> dict[int, np.ndarray]:
 
 
 def read_images(path: Path, frame: int):
-    cameras = []
+    """Per-camera poses for `frame`, named after that frame's extracted image.
+
+    convert_depthkit_to_4c4d.py emits exactly one pose entry per camera, always
+    named camXX_0000.png, because the rig is fixed for the whole clip. So for
+    any nonzero --frame there is no matching entry; reuse the frame-zero poses
+    and point their names at the requested frame instead of failing.
+    """
+    entries = [
+        fields for fields in
+        (line.split() for line in path.read_text(encoding="utf-8").splitlines())
+        if len(fields) >= 10
+    ]
     suffix = f"_{frame:04d}.png"
-    for line in path.read_text(encoding="utf-8").splitlines():
-        fields = line.split()
-        if len(fields) < 10 or not fields[9].endswith(suffix):
-            continue
+    matching = [fields for fields in entries if fields[9].endswith(suffix)]
+    if not matching:
+        matching = [fields for fields in entries if fields[9].endswith("_0000.png")]
+
+    cameras = []
+    for fields in matching:
         rotation = quaternion_to_rotation(np.asarray(fields[1:5], dtype=float))
         translation = np.asarray(fields[5:8], dtype=float)
         cameras.append({
             "rotation": rotation,
             "translation": translation,
             "camera_id": int(fields[8]),
-            "name": fields[9],
+            "name": re.sub(r"_\d{4}\.png$", suffix, fields[9]),
             "center": -rotation.T @ translation,
             "forward": rotation.T @ np.array([0.0, 0.0, 1.0]),
         })
@@ -162,7 +177,8 @@ def main():
     points = np.concatenate([triangulated, generated])
     colors = np.concatenate([triangulated_colors, generated_colors])
 
-    output = args.output or (sparse / "points3D.txt")
+    scene_points = sparse / "points3D.txt"
+    output = args.output or scene_points
     with output.open("w", encoding="utf-8") as handle:
         handle.write("# RGB-only calibrated-volume initialization; no depth data used\n")
         handle.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
@@ -185,16 +201,28 @@ def main():
         "farRadius": far_radius,
         "generatedVisibleInAtLeastTwoCameras": int(np.sum(visibility >= 2)),
         "generatedVisibleInNoCameras": int(np.sum(visibility == 0)),
+        "outputPath": str(output),
     }
     report_path = output.with_suffix(".rgb_init.json")
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    # Only claim the scene uses this cloud when it actually replaced the scene's
+    # active points3D.txt. For a detached --output the manifest would otherwise
+    # describe a cloud the dataset never loads, misreporting provenance.
     manifest_path = args.scene / "conversion_manifest.json"
-    if manifest_path.exists():
+    replaced_scene_points = output.resolve() == scene_points.resolve()
+    if manifest_path.exists() and replaced_scene_points:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["initialPointCount"] = len(points)
         manifest["initialPointSource"] = report["method"]
         manifest["depthDataUsed"] = False
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    elif manifest_path.exists():
+        print(
+            f"# wrote {output} without touching {manifest_path.name}: "
+            "the scene's active point cloud is unchanged",
+            file=sys.stderr,
+        )
     print(json.dumps(report, indent=2))
 
 

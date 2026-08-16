@@ -237,7 +237,7 @@ def inspect_video(path: Path) -> tuple[int, int, int]:
 
 
 def gather_cameras(
-    project_root: Path, project: dict[str, Any], recording_name: str
+    project_root: Path, project: dict[str, Any], recording_name: str, require_depth: bool = False
 ) -> tuple[list[CameraInput], list[str]]:
     recording = project.get("recordings", {}).get(recording_name)
     if recording is None:
@@ -274,13 +274,26 @@ def gather_cameras(
             continue
         try:
             color_calibration = calibration_for_stream(device, color_stream, "color")
-            depth_calibration = (
-                calibration_for_stream(device, depth_stream, "depth") if depth_stream else None
-            )
             world_pose = device["worldExtrinsics"]["world"]
         except (ConversionError, KeyError) as exc:
             problems.append(f"{device_id}: invalid calibration: {exc}")
             continue
+
+        # A broken depth profile only matters when depth points are actually
+        # requested. RGB pose generation and RGB-only initialization never read
+        # it, and write_initial_points already skips cameras whose depth
+        # calibration is None, so dropping the whole camera here would fail the
+        # camera-count checks over an unused stream.
+        depth_calibration = None
+        if depth_stream is not None:
+            try:
+                depth_calibration = calibration_for_stream(device, depth_stream, "depth")
+            except (ConversionError, KeyError) as exc:
+                message = f"{device_id}: invalid depth calibration: {exc}"
+                if require_depth:
+                    problems.append(message)
+                    continue
+                print(f"Warning: {message} (unused without --depth-points)", file=sys.stderr)
         expected_size = tuple(map(int, color_calibration["intrinsics"]["imageSize"]))
         if (width, height) != expected_size:
             problems.append(
@@ -621,7 +634,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ConversionError("--max-depth must be positive")
         project_root = discover_project_root(args.project)
         project = load_json(project_root / "dkproject.json")
-        cameras, problems = gather_cameras(project_root, project, args.recording)
+        cameras, problems = gather_cameras(
+            project_root, project, args.recording, require_depth=args.depth_points
+        )
         if not cameras:
             raise ConversionError("No complete calibrated color cameras are currently readable")
         color_k, _, color_to_world, maps = prepare_camera_models(cameras, args)
