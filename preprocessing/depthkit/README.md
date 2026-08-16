@@ -11,6 +11,9 @@ source .venv-depthkit/bin/activate
 pip install -r preprocessing/depthkit/requirements.txt
 ```
 
+Timestamp validation also requires `ffprobe` from FFmpeg to be available on
+`PATH`.
+
 On Windows PowerShell, activate the environment with
 `.venv-depthkit\Scripts\Activate.ps1` instead.
 
@@ -72,6 +75,24 @@ Conjugating with `H` is important: the resulting rotations remain proper
 physically rolled camera images just to make them appear upright unless the
 intrinsics and poses are transformed with them.
 
+## Verify RGB synchronization
+
+Before comparing camera poses, verify that equal frame numbers refer to equal
+presentation times in every RGB stream:
+
+```bash
+python preprocessing/depthkit/validate_rgb_sync.py \
+  --manifest /path/to/scene/conversion_manifest.json \
+  --frames 0,300,449 \
+  --output /path/to/rgb-sync-report.json \
+  --fail-on-quality-gate
+```
+
+This checks PTS alignment, cadence, gaps, and the requested common frame range.
+Matching container timestamps do not prove hardware shutter synchronization.
+For moving captures, also validate image content with a flash, timecode display,
+or cross-camera motion correlation.
+
 ## Verify poses from RGB matches
 
 A rig look-at score is only a coarse sanity check. Before a long training run,
@@ -82,14 +103,38 @@ compare the fixed model against COLMAP's verified matches:
 python preprocessing/depthkit/validate_rgb_calibration.py \
   --database /path/to/database.db \
   --model /path/to/scene/sparse/0 \
-  --output /path/to/calibration-report.json
+  --output /path/to/calibration-report.json \
+  --fail-on-quality-gate
 ```
 
-The supplied-pose error and COLMAP pairwise control should be of the same order.
+The report includes aggregate median, p90, and p95 Sampson errors; per-pair and
+per-camera support; reliable-neighbor counts; and connected components for the
+verified-match and calibration-consistent graphs. A low aggregate median is not
+sufficient if the tail is large or some cameras have no reliable neighbors.
+
+The default gate requires at least 30 verified matches per edge, COLMAP control
+p90 at most 4 px, supplied-pose median at most 2 px, supplied-pose p90 at most
+4 px, two reliable neighbors per camera, and a connected reliable graph. These
+are conservative starting values, not universal physical tolerances; expose any
+project-specific changes in the saved command and JSON report.
+
+Use multiple timestamps with static scene content. When a person or another
+non-rigid subject dominates the frame, mask it before feature extraction and
+prefer background, calibration-target, or empty-stage features. A pair should
+only drive a pose correction when its failure repeats across timestamps and its
+independent COLMAP control remains accurate.
+
 On the investigated ten-camera Xuelong take, the previous convention measured
-about 311 px median Sampson error, while the corrected Depthkit convention
-measured 2.00 px. RGB-only bundle adjustment reduced it to 1.20 px; COLMAP's
-independent pairwise control was 1.00 px.
+about 311 px median Sampson error. The corrected Depthkit convention measured
+2.00 px and RGB-only bundle adjustment reduced the aggregate median to 1.20 px,
+but the improved validator found a 269.96 px p90 and a disconnected
+calibration-consistent graph. The median-only acceptance was therefore
+superseded; see the dated experiment report for the dataset-specific evidence.
+
+Treat validation and pose refinement as separate operations. The validators do
+not rewrite calibration. A future refinement step should use static multi-frame
+tracks, anchor one camera and the rig scale, write a new model directory, and
+rerun both quality gates before training.
 
 ## Initialize without recorded depth
 

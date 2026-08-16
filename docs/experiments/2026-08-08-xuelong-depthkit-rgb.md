@@ -2,9 +2,9 @@
 
 Date: 2026-08-08
 
-Status: the corrected 10-camera run is complete; matched 6- and 8-camera
-ablations are in progress. Append final ablation results rather than replacing
-the pending entries below.
+Status: the 6-, 8-, and 10-camera runs are complete. A 2026-08-11 follow-up
+found that the median-only calibration acceptance was invalid; results below
+remain useful diagnostics but do not establish a fully calibrated rig.
 
 ## Objective
 
@@ -135,8 +135,8 @@ discarded after this was detected; they are not results.
 
 | Cameras | Training frames | Held-out frames | Final L1 | Final PSNR | Status |
 | ---: | ---: | ---: | ---: | ---: | --- |
-| 6 | 900 | 600 | pending | pending | running |
-| 8 | 1,200 | 300 | pending | pending | running |
+| 6 | 900 | 600 | 0.1162212 held-out | 15.3338 dB held-out | complete |
+| 8 | 1,200 | 300 | 0.0610094 held-out | 20.2633 dB held-out | complete |
 | 10 | 1,500 | 0 | 0.0172833 | 28.5980 dB | complete |
 
 First scheduled evaluation at iteration 1,500:
@@ -169,6 +169,55 @@ Two resolution-2 jobs ran concurrently at roughly 4 to 5 iterations/s each
 during the early phase with substantial VRAM headroom. The invalid full-
 resolution attempt was slower and drove one GPU to 84 C, demonstrating why the
 resolution check must precede conclusions about multi-GPU safety.
+
+## 2026-08-11 calibration audit correction
+
+The earlier 1.2037 px aggregate median concealed catastrophic residual tails.
+Revalidation of the accepted pose model measured:
+
+| Metric | Supplied pose | COLMAP pairwise control |
+| --- | ---: | ---: |
+| Median Sampson error | 1.2037 px | 0.9958 px |
+| p90 Sampson error | 269.9592 px | 3.3256 px |
+| Matches below 4 px | 69.15% | 99.31% |
+
+The verified RGB match graph connected all ten cameras, but the strict
+calibration-consistent graph split into six components. `cam09` had no reliable
+neighbors and a 65.66 px per-camera median across its verified matches. Several
+other camera regions also had large tails, so this is a global pose-graph
+problem rather than proof of one translation sign or scale error.
+
+Container timestamp and content-motion checks did not support a synchronization
+offset: source frame 300 was exactly 10.000 seconds in every MP4, frame cadence
+was 30 Hz without gaps across the pilot, and motion correlation for `cam05` and
+`cam09` peaked at zero lag. The source videos differed by one frame only at the
+end of the recording.
+
+Static-background tests at source frames 300, 386, and 449 retained severe pose
+tails while their independent pairwise controls remained accurate. In
+particular, `cam09`-`cam07` measured 72.34 px median at source frame 449. In
+contrast, `cam05`-`cam07` remained approximately 0.37-0.40 px median across the
+three timestamps, so the evidence does not justify a wholesale `cam05` pose or
+identity correction.
+
+A controlled 1,500-iteration diagnostic excluded `cam05` and `cam09` and used
+training views `0,1,2,3,4,6,7,8`. It completed in 356 seconds at resolution 2:
+
+| Population | L1 | PSNR |
+| --- | ---: | ---: |
+| trained views | 0.0297272 | 23.9856 dB |
+| held-out `cam05`,`cam09` | 0.1990717 | 11.3703 dB |
+
+The trained-view PSNR was 3.48 dB above the original eight-camera run at the
+same iteration, while the held-out pair failed severely. Because the held-out
+camera identities and coverage differ, this is a localization diagnostic rather
+than a comparable ablation score. It supports prioritizing `cam09` and the
+`cam01`/`cam06`/`cam07` region in a static RGB-only global recalibration.
+
+Reusable outcome: calibration acceptance must include residual tails,
+per-camera support, reliable-neighbor counts, graph connectivity, multi-frame
+static observations, and an independent synchronization audit. Dataset-specific
+poses or camera exclusions must not be embedded in the generic converter.
 
 ## Viewer orientation
 
@@ -207,10 +256,10 @@ this capture.
 
 ## Remaining work
 
-1. Append final 6- and 8-camera L1, PSNR, SSIM, Gaussian count, duration, and
-   qualitative viewer findings.
-2. Compare held-out metrics separately from seen-view metrics.
-3. Inspect the same timestamps and camera positions across all three models for
-   floaters, blur, missing limbs, temporal instability, and background leakage.
+1. Recover a new RGB-only global pose model from static multi-frame background
+   or calibration-target tracks, prioritizing `cam09` and the weak graph region.
+2. Rerun the calibration and synchronization quality gates before training.
+3. Extract final SSIM and Gaussian counts if the invalid calibration runs are
+   retained for optimization diagnostics.
 4. Decide whether upright raster conversion belongs in the Depthkit converter;
    if added, cover principal-point and pose rotation with tests.
