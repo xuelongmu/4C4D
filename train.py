@@ -44,6 +44,16 @@ except ImportError:
 from datetime import datetime
 
 
+def color_affine_key(image_name):
+    """Camera identity behind a frame's image name, for per-camera color affine.
+
+    Rig captures name frames <camera>_<frame> (cam03_0117), so the trailing
+    frame number is dropped; anything else is used whole.
+    """
+    head, sep, tail = image_name.rpartition('_')
+    return head if sep and tail.isdigit() else image_name
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
@@ -124,15 +134,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     color_affine_optimizer = None
     color_affine_index = {}
     if args.color_affine:
-        if args.training_view:
-            cam_names = list(args.training_view)
-        else:
-            cam_names = sorted({c.image_name.split('_')[0] for c in training_dataset.viewpoint_stack})
+        # Index by the cameras actually in the training set, not by
+        # args.training_view: the Blender loader ignores that list entirely, and
+        # the Colmap loader only honours it when eval is on, so with the default
+        # eval=False every camera outside the list missed the lookup, fell back
+        # to the never-optimized anchor at index 0, and the feature silently did
+        # nothing.
+        cam_names = sorted({color_affine_key(c.image_name)
+                            for c in training_dataset.viewpoint_stack})
         color_affine_index = {name: i for i, name in enumerate(cam_names)}
+        if len(cam_names) < 2:
+            print(f"Warning: --color_affine found {len(cam_names)} distinct camera(s) "
+                  f"({cam_names}); every view maps to the identity anchor, so "
+                  "compensation is a no-op for this dataset")
         color_affine_delta = nn.Parameter(torch.zeros(len(cam_names), 3, 4, device="cuda"))
         color_affine_optimizer = torch.optim.AdamW(
             [color_affine_delta], lr=args.color_affine_lr, weight_decay=args.color_affine_weight_decay)
         color_affine_eye = torch.eye(3, 4, device="cuda")
+
+        # Resuming must continue from the saved compensation, not from identity
+        # with a fresh optimizer, which would abruptly change the training
+        # objective mid-run.
+        if checkpoint:
+            affine_state_path = os.path.join(
+                os.path.dirname(checkpoint) or ".", "color_affine_resume.pth")
+            if os.path.exists(affine_state_path):
+                affine_state = torch.load(affine_state_path)
+                if affine_state['index'] == color_affine_index:
+                    color_affine_delta.data.copy_(affine_state['affine_delta'].cuda())
+                    color_affine_optimizer.load_state_dict(affine_state['optimizer'])
+                    print(f"Restored color affine state from {affine_state_path}")
+                else:
+                    print(f"Warning: {affine_state_path} indexes different cameras "
+                          "than this run; starting color affine from identity")
+            else:
+                print(f"Warning: --color_affine resumed from {checkpoint} but no "
+                      f"{os.path.basename(affine_state_path)} beside it; "
+                      "starting color affine from identity")
     if dataset.dataloader:
         print("\nUsing DataLoader for training dataset")
     else:
@@ -242,7 +280,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # Loss (per-camera color affine applies only to the training loss;
                 # eval and held-out renders stay raw; camera 0 is the anchor)
-                affine_idx = color_affine_index.get(viewpoint_cam.image_name.split('_')[0], 0) \
+                affine_idx = color_affine_index.get(color_affine_key(viewpoint_cam.image_name), 0) \
                     if color_affine_delta is not None else 0
                 if color_affine_delta is not None and affine_idx != 0:
                     affine = color_affine_eye + color_affine_delta[affine_idx]
@@ -419,9 +457,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
                     if color_affine_delta is not None:
-                        torch.save({'index': color_affine_index,
-                                    'affine_delta': color_affine_delta.detach().cpu()},
+                        affine_state = {'index': color_affine_index,
+                                        'affine_delta': color_affine_delta.detach().cpu(),
+                                        'optimizer': color_affine_optimizer.state_dict(),
+                                        'iteration': iteration}
+                        torch.save(affine_state,
                                    os.path.join(scene.model_path, f"color_affine_{iteration}.pth"))
+                        # Fixed name next to the checkpoints so --start_checkpoint
+                        # can find the matching affine state without being told
+                        # which iteration to look for.
+                        torch.save(affine_state,
+                                   os.path.join(scene.model_path, "color_affine_resume.pth"))
         
 def prepare_output_and_logger(args):    
     if not args.model_path:
