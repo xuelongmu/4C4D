@@ -44,19 +44,24 @@ def build_raster_settings(viewpoint_camera, pc: GaussianModel, pipe, bg_color: t
 
 
 def decay_visibility(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
-                     scaling_modifier=1.0):
+                     scaling_modifier=1.0, cov_t=None):
     """Gaussians this viewpoint can see, in both space and time.
 
     Used by the training loop to count, per gaussian, how many of the batch's
     viewpoints see it; that count becomes the opacity-decay exponent. The result
     is a boolean, so the 4D covariance chain behind get_marginal_t is built
     without autograd.
+
+    `cov_t` is the temporal covariance, which depends only on parameters that
+    change once per optimizer step. Passing it in lets a batch evaluate every
+    viewpoint against one covariance instead of rebuilding it per viewpoint.
     """
     with torch.no_grad():
         rasterizer = GaussianRasterizer(
             raster_settings=build_raster_settings(viewpoint_camera, pc, pipe, bg_color, scaling_modifier))
         space_visibility = rasterizer.markVisible(pc.get_xyz)
-        time_visibility = pc.get_marginal_t(viewpoint_camera.timestamp)[:, 0] > 0.05
+        time_visibility = pc.get_marginal_t(
+            viewpoint_camera.timestamp, cov_t=cov_t)[:, 0] > 0.05
         return space_visibility & time_visibility
 
 

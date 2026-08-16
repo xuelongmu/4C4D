@@ -213,9 +213,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if args.opacity_decay and iteration > args.decay_from_iter:
                 if args.time_aware:
                     visibility_counts = torch.zeros(gaussians.get_xyz.shape[0], 1, device="cuda")
+                    # The temporal covariance is the expensive part of the
+                    # visibility test (build_scaling_rotation_4d plus two
+                    # batched Nx4x4 GEMMs) and is the same for every viewpoint
+                    # in the step, so build it once instead of per camera.
+                    with torch.no_grad():
+                        cov_t = gaussians.get_cov_t()
                     for cam in batch_cams:
                         visibility_counts += decay_visibility(
-                            cam, gaussians, pipe, background).view(-1, 1).float()
+                            cam, gaussians, pipe, background, cov_t=cov_t).view(-1, 1).float()
                 else:
                     visibility_counts = batch_size
                 decayed_opacity = gaussians.opacity_decay(

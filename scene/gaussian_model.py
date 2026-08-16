@@ -252,8 +252,11 @@ class GaussianModel:
         else:
             return self.get_scaling_t * scaling_modifier
 
-    def get_marginal_t(self, timestamp, scaling_modifier = 1): # Standard
-        sigma = self.get_cov_t(scaling_modifier)
+    def get_marginal_t(self, timestamp, scaling_modifier = 1, cov_t=None): # Standard
+        # cov_t does not depend on the timestamp, so callers evaluating several
+        # viewpoints against the same parameters can compute it once and pass
+        # it in rather than rebuilding the 4D covariance chain per viewpoint.
+        sigma = self.get_cov_t(scaling_modifier) if cov_t is None else cov_t
         return torch.exp(-0.5*(self.get_t-timestamp)**2/sigma) # / torch.sqrt(2*torch.pi*sigma)
     
     def get_covariance(self, scaling_modifier = 1):
