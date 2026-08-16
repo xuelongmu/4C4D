@@ -101,3 +101,35 @@ fraction is only ~2.5%, so the gain likely comes from stabilizing background
 geometry early. **Adopted into the production config.** The full #20 design
 (3D-SH background subset, pretrained background) remains open with a higher
 ceiling.
+
+### Correction: seed-44 widens the static-freeze picture (appended)
+
+A third seed of the adopted production+freeze config landed at held-out
+**20.15 dB** (seeds 42/43 were 21.21 / 20.95). Two consequences:
+
+1. The static-freeze spread across three seeds is **1.06 dB** — far wider
+   than the ±0.4 dB working noise band, which was estimated from only two
+   control runs (20.48 / 20.39, spread 0.09). That band was too narrow.
+2. Seed 44's freeze result (20.15) is **below both control values**, so the
+   two-seed "+0.6-0.7 dB, adopted" conclusion is not safe as stated. The
+   earlier comparison was paired per seed, but only on two seeds.
+
+The decisive missing measurement is the **paired seed-44 control**
+(`ab8-nofreeze-s44`, same flags with `--no-freeze_static_temporal`), running
+now. Interpretation rules fixed in advance:
+
+- If control@44 is materially below 20.15, the freeze wins on all three
+  seeds and the adoption stands (with a corrected, wider noise band).
+- If control@44 is at or above 20.15, the freeze win does not replicate and
+  the production-config adoption must be reverted to a flag-only default,
+  the same way sqrt-batch LR was rejected.
+
+Until this resolves, treat `freeze_static_temporal: true` in
+`configs/custom/xuelong_posefix_production.yaml` as **provisional**.
+Downstream A/Bs that use the freeze in *both* arms (depth supervision #19,
+temporal densification #24, sparse Adam #17, full split #20) remain valid
+either way — they measure their own delta against a fixed base.
+
+Process lesson: two seeds were not enough to size the noise band. Future
+adoption decisions should estimate variance from at least three control
+seeds before judging a sub-1 dB effect.
