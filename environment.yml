@@ -18,6 +18,8 @@ dependencies:
     - imagesize==1.4.1
     - kornia==0.6.12
     - omegaconf==2.3.0
+    # build backend for the --sparse_adam CUDA extension, compiled on first use
+    - ninja
     - ./simple-knn
     - ./pointops2
     - ./fused-ssim-main

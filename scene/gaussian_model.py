@@ -94,7 +94,10 @@ class GaussianModel:
         # Boolean [N] mask of gaussians whose temporal support spans the whole
         # clip; maintained by train.py when --freeze_static_temporal is on.
         self.static_mask = None
-        
+        # Set by train.py before training_setup() when --sparse_adam is on;
+        # selects the masked Adam step instead of torch's dense one.
+        self.sparse_adam = False
+
         self.coefficient = coefficient
         self.setup_functions()
 
@@ -509,7 +512,11 @@ class GaussianModel:
             self.coef_optimizer = torch.optim.Adam(self.coefficient.parameters(), lr=training_args.coefficient_lr, eps=1e-15,
                                                   weight_decay=training_args.coefficient_weight_decay)
         
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        if self.sparse_adam:
+            from utils.sparse_adam import SparseGaussianAdam
+            self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
+        else:
+            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,

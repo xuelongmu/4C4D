@@ -64,7 +64,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians, num_pts=num_pts, num_pts_ratio=num_pts_ratio, 
                   time_duration=time_duration, training_view=args.training_view, testing_view=args.testing_view,
                   redundant_ratio=args.redundant_ratio, downsample_method=args.downsample_method)
-    gaussians.training_setup(opt)  
+    gaussians.sparse_adam = args.sparse_adam
+    gaussians.training_setup(opt)
     
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -343,9 +344,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if p.grad is not None:
                             p.grad[sm] = 0.0
 
-                # Optimizer step
+                # Optimizer step. With --sparse_adam only the gaussians the
+                # batch actually touched are updated; at 1M points barely an
+                # eighth of them are visible in a 4-view batch, and the dense
+                # step's cost is proportional to N regardless.
                 if iteration < opt.iterations:
-                    gaussians.optimizer.step()
+                    if gaussians.sparse_adam:
+                        gaussians.optimizer.step(visibility=visibility_filter)
+                    else:
+                        gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
                     
                     if gaussians.coefficient is not None:
@@ -531,6 +538,9 @@ if __name__ == "__main__":
                         help='decode all training images once and keep them as uint8 on the GPU')
     parser.add_argument('--freeze_static_temporal', action=BooleanOptionalAction, default=False,
                         help='zero temporal gradients of gaussians whose support spans the whole clip')
+    parser.add_argument('--sparse_adam', action=BooleanOptionalAction, default=False,
+                        help='restrict the Adam step to gaussians visible in the current batch '
+                             '(builds a CUDA extension on first use)')
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
