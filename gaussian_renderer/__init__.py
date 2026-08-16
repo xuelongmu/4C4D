@@ -16,24 +16,12 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh, eval_shfs_4d
 
-def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None, args=None, iteration=-1, apply_decay=True):
-    """
-    Render the scene. 
-    Background tensor (bg_color) must be on GPU!
-    """
- 
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-    try:
-        screenspace_points.retain_grad()
-    except:
-        pass
-
-    # Set up rasterization configuration
+def build_raster_settings(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
+                          scaling_modifier=1.0):
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
+    return GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
@@ -54,31 +42,52 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         debug=pipe.debug,
     )
 
+
+def decay_visibility(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
+                     scaling_modifier=1.0):
+    """Gaussians this viewpoint can see, in both space and time.
+
+    Used by the training loop to count, per gaussian, how many of the batch's
+    viewpoints see it; that count becomes the opacity-decay exponent. The result
+    is a boolean, so the 4D covariance chain behind get_marginal_t is built
+    without autograd.
+    """
+    with torch.no_grad():
+        rasterizer = GaussianRasterizer(
+            raster_settings=build_raster_settings(viewpoint_camera, pc, pipe, bg_color, scaling_modifier))
+        space_visibility = rasterizer.markVisible(pc.get_xyz)
+        time_visibility = pc.get_marginal_t(viewpoint_camera.timestamp)[:, 0] > 0.05
+        return space_visibility & time_visibility
+
+
+def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None, args=None, iteration=-1, decayed_opacity=None):
+    """
+    Render the scene.
+    Background tensor (bg_color) must be on GPU!
+
+    `decayed_opacity` is the once-per-optimizer-step decayed opacity computed by
+    the training loop; every render in the step shares that one tensor so the
+    decay is applied exactly once and each view's loss still reaches the
+    coefficient network through it.
+    """
+
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # Set up rasterization configuration
+    raster_settings = build_raster_settings(viewpoint_camera, pc, pipe, bg_color, scaling_modifier)
+
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
-    
-    # opacity decay: applied at most once per optimizer step (the caller passes
-    # apply_decay=False for all but one render in a batched iteration, since the
-    # in-place opacity update would otherwise compound batch_size times per step)
-    if (args is not None) and args.opacity_decay and apply_decay and (iteration > args.decay_from_iter):
-        if args.time_aware:
-            space_visibility = rasterizer.markVisible(means3D)
-            time_visibility = pc.get_marginal_t(viewpoint_camera.timestamp)[:,0] > 0.05 
-            visibility = space_visibility & time_visibility
-            visibility = visibility.view(-1, 1)
-        else:
-            visibility = None
-        
-        # Apply opacity decay to Gaussians that are visible in current view.
-        # The factor is compounded by batch_size so one application per step
-        # matches the expected decay of the previous once-per-batch-item
-        # behavior while being independent of batch composition and order.
-        visible_opacities = pc.opacity_decay(f_min=args.f_min, f_max=args.f_max, mask=visibility,
-                                             power=getattr(args, 'batch_size', 1))
-        opacity = visible_opacities
+    # Opacity decay is applied exactly once per optimizer step by the training
+    # loop, which passes the resulting tensor here for every render in the step.
+    opacity = pc.get_opacity if decayed_opacity is None else decayed_opacity
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.

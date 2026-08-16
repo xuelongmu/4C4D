@@ -1,25 +1,35 @@
+# Pins the environment the code is actually developed and validated against.
+#
+# The previous python=3.7.13 / pytorch=1.12.1 pins had already drifted away
+# from the source tree: train.py and render.py set
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which requires torch>=2.1,
+# and fused-ssim needs a modern toolchain. All experiments recorded under
+# docs/experiments/ were run on the versions below.
 name: 4c4d
 channels:
   - pytorch
+  - nvidia
   - conda-forge
   - defaults
 dependencies:
-  - cudatoolkit=11.6
-  - plyfile=0.8.1
-  - python=3.7.13
-  - pip=22.3.1
-  - pytorch=1.12.1
-  - torchaudio=0.12.1
-  - torchvision=0.13.1
+  - python=3.10
+  - pip
   - colmap
   - pip:
+    - torch==2.1.2+cu118
+    - torchvision==0.16.2+cu118
+    - torchaudio==2.1.2+cu118
+    - --extra-index-url https://download.pytorch.org/whl/cu118
+    - numpy==1.26.4
+    - plyfile==0.8.1
     - tqdm==4.66.1
     - torchmetrics==0.11.4
     - imagesize==1.4.1
     - kornia==0.6.12
     - omegaconf==2.3.0
+    - opencv-python
+    - imageio
     - ./simple-knn
     - ./pointops2
     - ./fused-ssim-main
     - ./diff_gaussian_rasterization
-    
