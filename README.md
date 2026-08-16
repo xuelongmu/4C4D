@@ -147,6 +147,11 @@ For calibrated multi-sensor Depthkit/Scatter captures, see the
 [`preprocessing/depthkit`](preprocessing/depthkit/) converter. It undistorts the
 RGB streams, converts the fixed rig calibration to COLMAP convention, and can
 initialize `points3D.txt` from synchronized depth frames.
+[`docs/experiments/2026-08-08-xuelong-depthkit-rgb.md`](docs/experiments/2026-08-08-xuelong-depthkit-rgb.md)
+records the RGB-only preparation workflow end to end — handedness conversion,
+epipolar validation, bundle adjustment, and the camera-count ablation — and
+[Production profile for a calibrated custom rig](#production-profile-for-a-calibrated-custom-rig)
+is the training profile validated on it.
 
 <details>
 <summary><b>Variable Reference</b></summary>
@@ -168,6 +173,85 @@ python train.py \
   --training_view $TRAIN_VIEW \
   --output_dir $OUTPUT_DIR
 ```
+
+The run directory is `ModelParams.model_path` from the config joined with
+`--output_dir`. `train.py` refuses to start if it already exists, and writes the
+fully merged argument set to `<run_dir>/training_params.txt`.
+
+#### Production profile for a calibrated custom rig
+
+`configs/custom/xuelong_posefix_production.yaml` is the validated profile for a
+sparse calibrated multi-camera capture, tuned on a 10-camera Depthkit/Scatter
+rig with two cameras held out. Against the pre-tuning code it trains 7,500
+iterations in **18:29 instead of ~47 min** on one A6000, at equal or better
+held-out quality and half the model size. Point `ModelParams.source_path` and
+`ModelParams.model_path` at your converted scene, then:
+
+```bash
+python train.py \
+  --config configs/custom/xuelong_posefix_production.yaml \
+  --res 2 \
+  --output_dir production \
+  --training_view 0,1,2,3,5,7,8,9
+```
+
+**Always pass `--res` explicitly.** It defaults to 1 and is applied *after* the
+YAML merge, so omitting it silently trains at full resolution.
+
+Any top-level YAML key that names a `train.py` argument overrides it, so the
+tuned behaviour below is config-settable as well as available on the CLI:
+
+| Config key / flag | Production value | Effect |
+| --- | --- | --- |
+| `gpu_cache` / `--gpu_cache` | `true` | decode the whole training set once and keep it as uint8 on the GPU; drops the DataLoader, per-iteration H2D copies and camera deepcopies. Quality-inert, ~17% less wall time. |
+| `freeze_static_temporal` / `--freeze_static_temporal` | `true` | zero the temporal gradients (`t`, `scaling_t`, `rotation_r`) of gaussians whose support spans the whole clip, so background geometry stops churning in time. +0.6-0.7 dB held-out on two seeds. |
+| `densify_until_num_points` / `--max_num_pts` | `1000000` | hard gaussian budget. Halves model size and wall time; above ~1M this scene only gains train-view fidelity. |
+| `exhaust_test` | `true` | evaluate held-out views on a regular schedule including the final iteration. |
+| `color_affine` / `--color_affine` | off | per-camera 3x4 color affine on the training loss. No gain on this rig (view-dependent SH already absorbed the mismatch); keep for rigs with worse color consistency. |
+
+Both boolean flags accept a negation on the CLI (`--no-gpu_cache`,
+`--no-freeze_static_temporal`) to override the config for an experiment.
+Deliberately *not* enabled: sqrt-batch LR scaling, rejected across three seeds.
+
+#### Running experiments on the trainer
+
+If you are changing the training loop rather than fitting a scene, follow
+[`docs/EXPERIMENT_METHODOLOGY.md`](docs/EXPERIMENT_METHODOLOGY.md) — the
+two-stage protocol (a ~2-minute smoke gate, then a full held-out A/B) and the
+branch/PR structure used to validate this profile.
+[`docs/LESSONS.md`](docs/LESSONS.md) records what was learned and, more
+usefully, which plausible changes failed and why.
+
+```bash
+# ~2 min: does this change break training?
+scripts/smoke_test.sh my-change 0
+
+# ~20 min/side: does it improve held-out quality? (one per GPU)
+scripts/ab_launch.sh /path/to/control-worktree ab8-control 1 && sleep 10
+scripts/ab_launch.sh /path/to/variant-worktree ab8-variant 0 && sleep 10
+```
+
+Both scripts honour `FOURC4D_PYTHON`; `ab_launch.sh` additionally honours
+`FOURC4D_AB_CONFIG` and `FOURC4D_AB_VIEWS`, and copies each run's log to
+`<run_dir>/train.log`.
+
+#### Regenerating the experiment comparison report
+
+`scripts/build_experiment_report.py` scans the run directories under an output
+root for `train.log` and `rendered_images/`, and writes one self-contained HTML
+file: held-out PSNR trajectories, a card per run with the held-out probe render
+(press and hold to flip to ground truth), and a summary table of verdicts.
+
+```bash
+python scripts/build_experiment_report.py \
+  --output-root $OUTPUT_ROOT/Xuelong/clip_f300_5s_rgb_posefix \
+  --out $REPORT_DIR/report.html
+```
+
+Add new experiments as rows in the `RUNS` manifest at the top of the script,
+in commit order, each with its phase and one-line verdict. The report embeds
+capture imagery whose redistribution licensing is not established — write it
+outside the repository and do not host it publicly.
 
 ### 4. Visualization
 
