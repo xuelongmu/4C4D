@@ -23,7 +23,14 @@ force_sh_3d: false
 batch_size: 4
 exhaust_test: true
 gpu_cache: true
-freeze_static_temporal: true
+# freeze_static_temporal: PROVISIONALLY DISABLED 2026-08-16.
+# It was adopted on a two-seed +0.6-0.7 dB win, but those runs used the
+# pre-d8a7d29 implementation in which zeroed gradients did not actually hold
+# parameters (Adam momentum kept stepping them) and stale masks could pin
+# unrelated gaussians after densification. Those measurements are void, not
+# merely weak. Re-enable only after a paired A/B on the fixed implementation
+# shows a win across three seeds. See docs/experiments/.
+freeze_static_temporal: false
 # The eight-camera split the profile was validated on; held out 4 and 6.
 # Without this, eval=true below would train on train.py's default 1,10,13,20
 # and hold out everything else.

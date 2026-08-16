@@ -133,3 +133,60 @@ either way — they measure their own delta against a fixed base.
 Process lesson: two seeds were not enough to size the noise band. Future
 adoption decisions should estimate variance from at least three control
 seeds before judging a sub-1 dB effect.
+
+### Resolution: the static-freeze runs were invalid, not merely unreplicated
+
+The paired seed-44 control landed at **20.44** held-out, above the 20.15 freeze
+run, which by the pre-registered rule already meant "does not replicate".
+The full paired picture:
+
+| Seed | control (no freeze) | freeze (pre-fix code) | delta |
+|---:|---:|---:|---:|
+| 42 | 20.48 | 21.21 | +0.73 |
+| 43 | 20.39 | 20.95 | +0.56 |
+| 44 | 20.44 | 20.15 | **−0.29** |
+| spread | **0.09** | **1.06** | |
+
+The variance asymmetry is the tell: the control configuration is extremely
+stable (0.09 dB across three seeds) while the "freeze" arm swings 1.06 dB. A
+feature that merely helps or does not help should not multiply run-to-run
+variance more than tenfold.
+
+Codex review on PR #40 found the cause, fixed in commit `d8a7d29`:
+
+1. **Zeroing a gradient does not freeze a parameter under Adam.** First- and
+   second-moment state from before a gaussian became static keeps stepping
+   the masked rows until momentum decays. Reproduced in isolation: after 30
+   steps the "frozen" rows drifted 0.150 while free rows moved 0.163 — the
+   freeze was roughly 8% effective.
+2. **Stale masks.** The mask was reused whenever its length matched the
+   parameter length, but densification appends rows and pruning compacts
+   them, so equal length does not mean equal identity; the mask could pin
+   arbitrary unrelated gaussians. This is a seed-dependent random
+   perturbation and is the most likely source of the 1.06 dB spread.
+
+**All three freeze runs are therefore invalid as measurements of the intended
+feature** — they measured a mostly-ineffective freeze plus random parameter
+pinning. The correct status of #20-lite is *never validly measured*, not
+*won then failed to replicate*. `freeze_static_temporal` is set back to
+`false` in the production config pending a paired A/B on the fixed code.
+
+The **no-freeze controls remain valid** (they never exercised the code path):
+20.48 / 20.39 / 20.44, spread 0.09 dB. That is the real noise floor for the
+production configuration, and it is far tighter than the ±0.4 dB band assumed
+earlier. The wide band was an artifact of the buggy arm.
+
+#### Process lessons
+
+1. **A control must be run from the same base revision as its experimental
+   arm.** Historical control numbers cannot be reused across a base-code
+   change. Downstream sessions were briefed with the old freeze numbers as
+   controls and have been corrected.
+2. **Variance asymmetry between arms is a bug signal, not a noise
+   observation.** The correct response to "my treatment arm is 10x noisier
+   than my control" is to audit the treatment code, not to widen the error
+   bars and average more seeds. Widening the band was the wrong instinct.
+3. **Verify that a mechanism does what its name claims before measuring its
+   effect.** A one-line assertion that the frozen rows do not change between
+   steps would have caught this before any full run. The smoke test proved
+   the code ran; it never proved the freeze froze.
