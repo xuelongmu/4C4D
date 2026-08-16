@@ -183,14 +183,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("\nBuilding GPU-resident image cache "
               f"({len(training_dataset)} images)...")
         from concurrent.futures import ThreadPoolExecutor
+
+        def decode_to_uint8(i):
+            img, cam = training_dataset[i]
+            # Quantize inside the worker so host memory holds one uint8 frame
+            # rather than every decoded float32 frame at once: collecting the
+            # whole set as float32 first peaks at ~4x the final cache size and
+            # can exhaust host RAM before the transfer even starts.
+            img = (img * 255.0).round().to(torch.uint8)
+            # With dataloader=False the camera carries its own decoded float32
+            # image, and Camera.cuda() deepcopies every tensor attribute. Left
+            # in place that would put a second, 4x larger float copy of the same
+            # frame on the GPU beside the cache. The cache owns the pixels now.
+            cam.image = None
+            return img, cam
+
         with ThreadPoolExecutor(max_workers=8) as pool:  # cv2 decode releases the GIL
-            cached = list(pool.map(lambda i: training_dataset[i], range(len(training_dataset))))
+            cached = list(pool.map(decode_to_uint8, range(len(training_dataset))))
         cache_cameras = [cam.cuda() for _, cam in cached]
-        gpu_images = torch.stack(
-            [(img * 255.0).round().to(torch.uint8) for img, _ in cached]).cuda()
+        shapes = {tuple(img.shape) for img, _ in cached}
+        if len(shapes) == 1:
+            # One contiguous allocation when the rig is uniform.
+            gpu_images = torch.stack([img for img, _ in cached]).cuda()
+            cache_bytes = gpu_images.numel()
+            shape_note = f"{tuple(gpu_images.shape)} uint8"
+        else:
+            # Mixed intrinsics give per-camera image sizes, which cannot stack.
+            # The list indexes identically and the render path is per-item.
+            gpu_images = [img.cuda() for img, _ in cached]
+            cache_bytes = sum(img.numel() for img in gpu_images)
+            shape_note = f"{len(gpu_images)} frames, {len(shapes)} distinct sizes, uint8"
         del cached
-        print(f"GPU image cache: {tuple(gpu_images.shape)} uint8, "
-              f"{gpu_images.numel() / 1e9:.2f} GB")
+        print(f"GPU image cache: {shape_note}, {cache_bytes / 1e9:.2f} GB")
 
         def gpu_cache_batches():
             order = torch.randperm(len(cache_cameras)).tolist()
@@ -664,15 +688,15 @@ if __name__ == "__main__":
     parser.parse_args(sys.argv[1:], namespace=cli_probe)
     cli_explicit = {dest for dest, value in vars(cli_probe).items() if value is not _unset}
 
-    args.save_iterations.append(args.iterations)
-
     cfg = OmegaConf.load(args.config)
+    cfg_keys = set()
     def recursive_merge(key, host):
         if isinstance(host[key], DictConfig):
             for key1 in host[key].keys():
                 recursive_merge(key1, host[key])
         else:
             assert hasattr(args, key), key
+            cfg_keys.add(key)
             if key in cli_explicit:
                 return  # an explicit command-line value outranks the config
             setattr(args, key, host[key])
@@ -686,19 +710,35 @@ if __name__ == "__main__":
         # silently dropped the end-of-training evaluation.
         args.test_iterations = args.test_iterations + [i for i in range(0, args.iterations, args.test_per_iter)] + [args.iterations]
         
-    if args.initial_num_pts is not None:
+    # The final iteration is only known after the merge, so append it here.
+    # Appending before the merge recorded the parser default (30000) and left a
+    # profile ending at 7500 with no final save at all.
+    if args.iterations not in args.save_iterations:
+        args.save_iterations.append(args.iterations)
+
+    # These flags are aliases for config keys, and their defaults are non-None
+    # sentinels (initial_num_pts=-1, res=1, weight_decay=1e-4), so applying them
+    # unconditionally overwrote whatever the config had just set: a profile's
+    # num_pts, resolution and coefficient_weight_decay were silently discarded
+    # unless the same value was repeated on the command line. Let the alias
+    # through when it was actually typed, or when the config left that key
+    # alone, so configs that rely on the alias defaults are unaffected.
+    def alias_wins(flag, cfg_key):
+        return flag in cli_explicit or cfg_key not in cfg_keys
+
+    if alias_wins('initial_num_pts', 'num_pts') and args.initial_num_pts is not None:
         args.num_pts = args.initial_num_pts
-                
+
     if args.max_num_pts is not None:
         args.densify_until_num_points = args.max_num_pts
-        
-    if args.res is not None:
+
+    if alias_wins('res', 'resolution') and args.res is not None:
         args.resolution = args.res
-        
+
     if args.output_dir:
         args.model_path = os.path.join(args.model_path, args.output_dir)
-        
-    if args.weight_decay:
+
+    if alias_wins('weight_decay', 'coefficient_weight_decay') and args.weight_decay:
         args.coefficient_weight_decay = args.weight_decay
     
     if os.path.exists(args.model_path):

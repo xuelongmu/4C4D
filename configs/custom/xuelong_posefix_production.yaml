@@ -8,6 +8,12 @@
 # pre-fix), held-out 20.48-20.61 dB on the 8-camera split.
 # Deliberately NOT included: sqrt-batch LR scaling (#16) pending multi-seed
 # confirmation; --color_affine (no gain on this rig, #21).
+#
+# Paths come from the environment so the profile is not tied to one machine:
+#   FOURC4D_DATASET=.../data/Xuelong/clip_f300_5s_rgb_posefix \
+#   FOURC4D_OUTPUT=.../output/Xuelong/clip_f300_5s_rgb_posefix_production \
+#   python train.py --config configs/custom/xuelong_posefix_production.yaml
+# Everything the validated run used is in this file; no extra flags needed.
 gaussian_dim: 4
 time_duration: [0.0, 5.0]
 num_pts: 75000
@@ -18,11 +24,15 @@ batch_size: 4
 exhaust_test: true
 gpu_cache: true
 freeze_static_temporal: true
+# The eight-camera split the profile was validated on; held out 4 and 6.
+# Without this, eval=true below would train on train.py's default 1,10,13,20
+# and hold out everything else.
+training_view: "0,1,2,3,5,7,8,9"
 
 ModelParams:
   sh_degree: 3
-  source_path: "/home/zerospace/4C4D/data/Xuelong/clip_f300_5s_rgb_posefix"
-  model_path: "/home/zerospace/4C4D/output/Xuelong/clip_f300_5s_rgb_posefix_production"
+  source_path: "${oc.env:FOURC4D_DATASET}"
+  model_path: "${oc.env:FOURC4D_OUTPUT}"
   images: "images"
   resolution: 2
   white_background: false

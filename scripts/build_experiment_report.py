@@ -18,6 +18,7 @@ Usage:
 import argparse
 import base64
 import html
+import json
 import os
 import re
 
@@ -172,6 +173,22 @@ def main():
         f"<td>{html.escape(v)}</td></tr>"
         for t, p, tr, te, w, g, v, _, c in rows)
 
+    # No probe render had a matching _gt.png (empty, partial, or copied output
+    # root). Emit valid JS and drop the comparison UI rather than writing
+    # `const GT = None;`, which is a ReferenceError that breaks the whole
+    # script, and an <img src="None">.
+    gt_json = json.dumps(gt_uri)
+    if gt_uri:
+        gt_section = ('<h2>Ground truth reference (held-out view)</h2>\n'
+                      f'<div id="gtbox"><img src="{gt_uri}"></div>')
+        gt_hint = ('<b>Press and hold any render to flip to ground truth</b>; '
+                   'release to flip back.')
+    else:
+        gt_section = ('<h2>Ground truth reference (held-out view)</h2>\n'
+                      '<div class="noimg">No ground-truth frame found beside the '
+                      'probe renders; press-to-compare is disabled.</div>')
+        gt_hint = ''
+
     doc = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>4C4D experiment comparison — Xuelong 8-cam held-out probe</title>
 <style>
@@ -194,13 +211,12 @@ td, th {{ padding:6px 10px; border-bottom:1px solid #2a3038; text-align:left; }}
 </style></head><body>
 <h1>4C4D experiment comparison</h1>
 <p class="hint">Held-out probe: camera <b>cam06</b>, frame 36 (never seen in training).
-<b>Press and hold any render to flip to ground truth</b>; release to flip back.
+{gt_hint}
 Xuelong scene, 8-camera split, seed 42 unless noted. Full protocol:
 <code>docs/experiments/2026-08-10-tier0-bugfixes.md</code> and
 <code>2026-08-10-enhancement-experiments.md</code>. Local file — imagery licensing
 unestablished, do not redistribute.</p>
-<h2>Ground truth reference (held-out view)</h2>
-<div id="gtbox"><img src="{gt_uri}"></div>
+{gt_section}
 <h2>Held-out PSNR over training</h2>
 {svg_chart(chart_series)}
 <h2>Experiments</h2>
@@ -209,13 +225,15 @@ unestablished, do not redistribute.</p>
 <table><tr><th>Run</th><th>Phase</th><th>Train PSNR</th><th>Held-out PSNR</th><th>Wall</th><th>Gaussians</th><th>Verdict</th></tr>
 {table_rows}</table>
 <script>
-const GT = {gt_uri!r};
-document.querySelectorAll('.card img').forEach(img => {{
-  const flip = on => {{ img.src = on ? GT : img.dataset.render; }};
-  img.addEventListener('pointerdown', e => {{ e.preventDefault(); flip(true); }});
-  ['pointerup','pointerleave','pointercancel'].forEach(ev =>
-    img.addEventListener(ev, () => flip(false)));
-}});
+const GT = {gt_json};
+if (GT) {{
+  document.querySelectorAll('.card img').forEach(img => {{
+    const flip = on => {{ img.src = on ? GT : img.dataset.render; }};
+    img.addEventListener('pointerdown', e => {{ e.preventDefault(); flip(true); }});
+    ['pointerup','pointerleave','pointercancel'].forEach(ev =>
+      img.addEventListener(ev, () => flip(false)));
+  }});
+}}
 </script>
 </body></html>"""
     with open(args.out, "w") as f:
