@@ -48,9 +48,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
 
+    # The regularizer losses behind lambda_opa_mask/lambda_rigid/lambda_motion
+    # are not implemented; the previous vars()-based EMA plumbing silently did
+    # nothing and would raise KeyError if a lambda were nonzero. Fail fast
+    # instead of training something other than what the config claims, and do
+    # it before the logger, model, and scene are built so an invalid config
+    # does not pay the dataset load and CUDA allocations first.
+    unimplemented_lambdas = [key for key in opt.__dict__.keys()
+                             if key.startswith('lambda') and key != 'lambda_dssim'
+                             and opt.__dict__[key] != 0]
+    if unimplemented_lambdas:
+        raise NotImplementedError(
+            f"Losses for {unimplemented_lambdas} are not implemented; set them to 0 "
+            "or implement the corresponding regularizers.")
+
     if dataset.frame_ratio > 1:
         time_duration = [time_duration[0] / dataset.frame_ratio,  time_duration[1] / dataset.frame_ratio]
-    
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     
@@ -81,10 +95,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_l1loss_for_log = 0.0
     ema_ssimloss_for_log = 0.0
-    lambda_all = [key for key in opt.__dict__.keys() if key.startswith('lambda') and key!='lambda_dssim']
-    for lambda_name in lambda_all:
-        vars()[f"ema_{lambda_name.replace('lambda_','')}_for_log"] = 0.0
-    
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training", ncols=110)
     first_iter += 1
         
@@ -196,21 +207,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                     ema_l1loss_for_log = 0.4 * Ll1.item() + 0.6 * ema_l1loss_for_log
                     ema_ssimloss_for_log = 0.4 * Lssim.item() + 0.6 * ema_ssimloss_for_log
-                    
-                    for lambda_name in lambda_all:
-                        if opt.__dict__[lambda_name] > 0:
-                            ema = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
-                            vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"] = 0.4 * vars()[f"L{lambda_name.replace('lambda_', '')}"].item() + 0.6*ema
-                            loss_dict[lambda_name.replace("lambda_", "L")] = vars()[lambda_name.replace("lambda_", "L")]
-                            
+
                     postfix = {"Loss": f"{ema_loss_for_log:.{7}f}",
                                 "PSNR": f"{psnr_for_log:.{2}f}",
                                 "gs_num":f"{gaussians.get_xyz.shape[0]}"}
-                    
-                    for lambda_name in lambda_all:
-                        if opt.__dict__[lambda_name] > 0:
-                            ema_loss = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
-                            postfix[lambda_name.replace("lambda_", "L")] = f"{ema_loss:.{4}f}"
 
                     progress_bar.set_postfix(postfix)
                     progress_bar.update(10)
