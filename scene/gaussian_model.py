@@ -394,7 +394,11 @@ class GaussianModel:
         
         dtype_full = [(name, 'f4') for name in construct_list_of_attributes(self)]
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        elements[:] = list(map(tuple, attributes))
+        # Vectorized per-field assignment; building a Python tuple per gaussian
+        # took minutes of single-threaded CPU at 2M points.
+        attributes = np.ascontiguousarray(attributes, dtype=np.float32)
+        for i, name in enumerate(elements.dtype.names):
+            elements[name] = attributes[:, i]
 
         el = PlyElement.describe(elements, 'vertex')
         ply_data = PlyData([el])
