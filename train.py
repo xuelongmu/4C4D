@@ -16,7 +16,7 @@ import random
 import torch
 from torch import nn
 from utils.loss_utils import l1_loss #, ssim, msssim
-from gaussian_renderer import render
+from gaussian_renderer import render, decay_visibility
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -129,14 +129,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             batch_point_grad = []
             batch_visibility_filter = []
             batch_radii = []
-            
+
+            batch_cams = [batch_data[i][1].cuda() for i in range(batch_size)]
+
+            # Opacity decay, applied exactly once per optimizer step rather than
+            # once per batch item. Each gaussian's decay exponent is the number
+            # of the step's viewpoints that can see it, so the result does not
+            # depend on which camera happens to come first in the shuffled
+            # batch. The single decayed tensor is then shared by every render in
+            # the step, which keeps each view's loss connected to the
+            # coefficient network.
+            decayed_opacity = None
+            if args.opacity_decay and iteration > args.decay_from_iter:
+                if args.time_aware:
+                    visibility_counts = torch.zeros(gaussians.get_xyz.shape[0], 1, device="cuda")
+                    for cam in batch_cams:
+                        visibility_counts += decay_visibility(
+                            cam, gaussians, pipe, background).view(-1, 1).float()
+                else:
+                    visibility_counts = batch_size
+                decayed_opacity = gaussians.opacity_decay(
+                    f_min=args.f_min, f_max=args.f_max, power=visibility_counts)
+
             for batch_idx in range(batch_size):
-                gt_image, viewpoint_cam = batch_data[batch_idx]
+                gt_image, _ = batch_data[batch_idx]
+                viewpoint_cam = batch_cams[batch_idx]
                 gt_image = gt_image.cuda()
-                viewpoint_cam = viewpoint_cam.cuda()
-                
+
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration,
-                                    apply_decay=(batch_idx == 0))
+                                    decayed_opacity=decayed_opacity)
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                 # depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
