@@ -142,7 +142,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--output-root", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--rescored", nargs="*", default=[],
+                    help="JSON files from evaluate_full_heldout.py; adds the "
+                         "full-held-out column that the 3-image training metric "
+                         "could not provide")
     args = ap.parse_args()
+
+    rescored = {}
+    for rp in args.rescored:
+        if os.path.exists(rp):
+            with open(rp) as f:
+                rescored.update(json.load(f))
 
     gt_uri = None
     cards = []
@@ -162,11 +172,13 @@ def main():
         chart_series.append((title, PALETTE[i % len(PALETTE)], test_pts))
         last_test = max(test_pts) if test_pts else None
         last_train = max(train_pts) if train_pts else None
+        full = rescored.get(run)
+        full_txt = (f"{full['psnr']:.2f} (n={full['n_images']})" if full else "—")
         rows.append((title, phase,
                      f"{train_pts[last_train]:.2f} @{last_train}" if last_train else "—",
                      f"{test_pts[last_test]:.2f} @{last_test}" if last_test else "—",
                      wall or "—", f"{gs:,}" if gs else "—", verdict, issue,
-                     PALETTE[i % len(PALETTE)]))
+                     PALETTE[i % len(PALETTE)], full_txt))
         issue_html = f' · <a href="{ISSUES_URL}{issue}">#{issue}</a>' if issue else ""
         img_html = (f'<img src="{img_uri}" data-render="{img_uri}" loading="lazy" '
                     f'title="hold to compare with ground truth">' if img_uri
@@ -177,16 +189,17 @@ def main():
   <div class="cardhead"><span class="dot" style="background:{PALETTE[i % len(PALETTE)]}"></span>
     <b>{html.escape(title)}</b><span class="phase">{html.escape(phase)}{issue_html}</span></div>
   {img_html}
-  <div class="meta">held-out {html.escape(rows[-1][3])} · train {html.escape(rows[-1][2])} · wall {html.escape(rows[-1][4])} · {html.escape(rows[-1][5])} gaussians</div>
+  <div class="meta"><b>full held-out {html.escape(full_txt)}</b> · 3-img {html.escape(rows[-1][3])} · train {html.escape(rows[-1][2])} · wall {html.escape(rows[-1][4])} · {html.escape(rows[-1][5])} gaussians</div>
   <div class="verdict">{html.escape(verdict)}</div>
 </div>""")
 
     table_rows = "".join(
         f"<tr><td><span class='dot' style='background:{c}'></span>{html.escape(t)}</td>"
-        f"<td>{html.escape(p)}</td><td>{html.escape(tr)}</td><td><b>{html.escape(te)}</b></td>"
+        f"<td>{html.escape(p)}</td><td>{html.escape(tr)}</td><td><b>{html.escape(fu)}</b></td>"
+        f"<td class='dim'>{html.escape(te)}</td>"
         f"<td>{html.escape(w)}</td><td>{html.escape(g)}</td>"
         f"<td>{html.escape(v)}</td></tr>"
-        for t, p, tr, te, w, g, v, _, c in rows)
+        for t, p, tr, te, w, g, v, _, c, fu in rows)
 
     # No probe render had a matching _gt.png (empty, partial, or copied output
     # root). Emit valid JS and drop the comparison UI rather than writing
@@ -225,6 +238,7 @@ a {{ color:#6fb3ff; }}
 table {{ border-collapse:collapse; width:100%; font-size:13px; }}
 td, th {{ padding:6px 10px; border-bottom:1px solid #2a3038; text-align:left; }}
 .hint {{ color:#8a94a2; }}
+.dim {{ color:#6b7683; }}
 .noimg {{ padding:40px; text-align:center; color:#566; background:#10141a; border-radius:6px; }}
 #gtbox img {{ max-width:640px; width:100%; border-radius:8px; }}
 </style></head><body>
@@ -241,7 +255,7 @@ unestablished, do not redistribute.</p>
 <h2>Experiments</h2>
 <div class="grid">{"".join(cards)}</div>
 <h2>Summary table</h2>
-<table><tr><th>Run</th><th>Phase</th><th>Train PSNR</th><th>Held-out PSNR</th><th>Wall</th><th>Gaussians</th><th>Verdict</th></tr>
+<table><tr><th>Run</th><th>Phase</th><th>Train PSNR</th><th>Held-out (full 300)</th><th>Held-out (3-img, misleading)</th><th>Wall</th><th>Gaussians</th><th>Verdict</th></tr>
 {table_rows}</table>
 <script>
 const GT = {gt_json};
