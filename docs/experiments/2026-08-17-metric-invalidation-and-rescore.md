@@ -103,3 +103,76 @@ on all 300 held-out images with `scripts/evaluate_full_heldout.py`:
    **a mechanism was assumed to do what its name implied and was never
    verified.** The other two were caught by review; this one was caught only
    because a variance anomaly forced an audit.
+
+## Addendum: the variance is nondeterminism, not seeds
+
+Three runs, **identical seed 42**, identical config, identical code, scored on
+all 300 held-out images:
+
+| run | full held-out PSNR |
+|---|---:|
+| `fx-ctl-s42` | 19.45 |
+| `fx-repA-s42` | 20.02 |
+| `fx-repB-s42` | 20.35 |
+| **same-seed spread** | **0.90 dB** |
+
+For comparison, the three *different*-seed controls spread 0.88 dB
+(19.45 / 20.03 / 20.33). **The two are the same.** Seeds contribute nothing
+measurable; essentially all run-to-run variance is nondeterminism in training
+itself — the rasterizer backward accumulates gradients with CUDA atomics, and
+floating-point addition is not associative, so scheduling order changes the
+result. `torch.backends.cudnn.deterministic = True` does not touch custom
+kernels.
+
+### What this invalidates
+
+**Multi-seed replication, as practised throughout this campaign, measured
+nothing it was supposed to measure.** Running seeds 42/43/44 was not probing
+seed sensitivity; it was drawing three samples from one noisy process. The
+"two-seed replication" that adopted the static freeze, and the "three-seed
+rejection" of sqrt-batch LR, were both just repeated draws — the rejection
+happened to be right, the adoption happened to be wrong.
+
+### What the benchmark can actually resolve
+
+Single-run standard deviation is roughly **0.45 dB**. For a paired two-arm
+comparison at 80% power, detecting an effect of size *d* needs about
+`n ≈ 2 σ² (2.8 / d)²` runs per arm:
+
+| effect | runs per arm | wall time (18 min each) |
+|---:|---:|---|
+| 1.5 dB | 2 | ~1 h |
+| 1.0 dB | 4 | ~2.5 h |
+| 0.5 dB | 13 | ~8 h |
+| 0.3 dB | 35 | ~21 h |
+
+So **sub-0.5 dB effects are not affordably measurable** on this benchmark as
+configured. Re-reading the re-derivation table against that bar:
+
+- **Established** (far outside noise): #5 temporal densification −3.43 dB,
+  #10 temporal prune −1.52 dB. Both rejections stand firmly.
+- **Unresolved** (inside noise, single runs): #7 decay +0.37, #18 budget
+  −0.36, #15 cache −0.14, #16 sqrt-LR −0.04, #20 freeze ~0. None of these is
+  established in either direction, including the one win the campaign still
+  claimed.
+
+The honest summary of the whole quality track is therefore: **two large
+negative results are solid; no positive quality claim survives.** The speed
+and size results are unaffected — wall time and gaussian count are
+low-variance measurements.
+
+### Recommended changes to protocol
+
+1. **Report the mean of k repeats with its spread, never a single run**, and
+   pick k from the table above for the effect size that would matter.
+2. **Chase variance reduction before chasing effects.** Options worth trying,
+   cheapest first: average metrics over several late checkpoints instead of
+   the final one; evaluate at several iterations and fit a trend; look for a
+   deterministic accumulation path in the rasterizer backward (a
+   `-DDETERMINISTIC` build or sorted-scatter reduction) and measure the cost.
+3. **Prefer large-effect experiments.** Structural changes (depth supervision,
+   architecture) can clear 1 dB; hyperparameter nudges cannot be seen here at
+   all, so they are not worth the GPU time on this scene.
+4. **Or change the instrument**: a longer clip, more held-out cameras, or
+   several scenes would raise the effect-to-noise ratio far more cheaply than
+   repeat runs.
