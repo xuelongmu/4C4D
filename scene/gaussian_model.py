@@ -91,6 +91,9 @@ class GaussianModel:
         
         self.active_sh_degree_t = 0
         self.max_sh_degree_t = sh_degree_t
+        # Boolean [N] mask of gaussians whose temporal support spans the whole
+        # clip; maintained by train.py when --freeze_static_temporal is on.
+        self.static_mask = None
         
         self.coefficient = coefficient
         self.setup_functions()
@@ -249,8 +252,11 @@ class GaussianModel:
         else:
             return self.get_scaling_t * scaling_modifier
 
-    def get_marginal_t(self, timestamp, scaling_modifier = 1): # Standard
-        sigma = self.get_cov_t(scaling_modifier)
+    def get_marginal_t(self, timestamp, scaling_modifier = 1, cov_t=None): # Standard
+        # cov_t does not depend on the timestamp, so callers evaluating several
+        # viewpoints against the same parameters can compute it once and pass
+        # it in rather than rebuilding the 4D covariance chain per viewpoint.
+        sigma = self.get_cov_t(scaling_modifier) if cov_t is None else cov_t
         return torch.exp(-0.5*(self.get_t-timestamp)**2/sigma) # / torch.sqrt(2*torch.pi*sigma)
     
     def get_covariance(self, scaling_modifier = 1):
@@ -391,7 +397,11 @@ class GaussianModel:
         
         dtype_full = [(name, 'f4') for name in construct_list_of_attributes(self)]
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        elements[:] = list(map(tuple, attributes))
+        # Vectorized per-field assignment; building a Python tuple per gaussian
+        # took minutes of single-threaded CPU at 2M points.
+        attributes = np.ascontiguousarray(attributes, dtype=np.float32)
+        for i, name in enumerate(elements.dtype.names):
+            elements[name] = attributes[:, i]
 
         el = PlyElement.describe(elements, 'vertex')
         ply_data = PlyData([el])
@@ -581,7 +591,21 @@ class GaussianModel:
                 self._rotation_r = optimizable_tensors['rotation_r']
             self.t_gradient_accum = self.t_gradient_accum[valid_points_mask]
 
-    def opacity_decay(self, f_min=0.99, mode='net', p=2, f_max=1.0, mask=None):
+    def opacity_decay(self, f_min=0.99, mode='net', p=2, f_max=1.0, mask=None, power=1):
+        """Decay opacity once per optimizer step.
+
+        `power` is the exponent applied to the decay factor: either a scalar,
+        or an [N, 1] tensor holding, per gaussian, how many of the step's
+        viewpoints could see it. Compounding one factor this way keeps the
+        effective per-step decay consistent with the released configs, which
+        decayed once per batch item, while making the result independent of
+        batch order and composition. A count of 0 yields a factor of exactly 1,
+        so gaussians no viewpoint saw are left untouched.
+
+        The returned opacity keeps its autograd path to `coefficient`, so every
+        render in the step can share it and contribute to the coefficient's
+        gradient.
+        """
         old_opacity = self.get_opacity
         if mode == 'const':
             curr_opacity = old_opacity * f_min
@@ -602,7 +626,10 @@ class GaussianModel:
         elif mode == 'net': # [f_min, f_max]
             if self.coefficient is None:
                 raise ValueError("Coefficient is not defined")
-            curr_opacity = old_opacity * (f_min + (f_max - f_min) * self.coefficient(old_opacity, self.get_xyzt, self.get_scaling_xyzt))
+            factor = f_min + (f_max - f_min) * self.coefficient(old_opacity, self.get_xyzt, self.get_scaling_xyzt)
+            if torch.is_tensor(power) or power != 1:
+                factor = factor ** power
+            curr_opacity = old_opacity * factor
         elif mode == 'power_desc': 
             assert p > 0, "p should be greater than 0"
             curr_opacity = old_opacity * (f_min + (f_max - f_min) * ((1 - old_opacity) ** p))
@@ -612,10 +639,12 @@ class GaussianModel:
         else:
             raise NotImplementedError("Opacity decay mode not implemented")
         
-        opacity = old_opacity
-        if mask is not None: 
-            opacity = torch.where(mask, curr_opacity, old_opacity)
-            
+        # A per-gaussian `power` already encodes visibility (count 0 leaves the
+        # opacity unchanged), so `mask` is only needed by the modes that ignore
+        # `power`. Previously a None mask discarded curr_opacity entirely, which
+        # made decay a silent no-op whenever time_aware was off.
+        opacity = curr_opacity if mask is None else torch.where(mask, curr_opacity, old_opacity)
+
         self._opacity.data = self.inverse_opacity_activation(opacity)
         return opacity
           
@@ -681,7 +710,6 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
-        print(f"num_to_densify_pos: {torch.where(padded_grad >= grad_threshold, True, False).sum()}, num_to_split_pos: {selected_pts_mask.sum()}")
         
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
@@ -725,7 +753,6 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        print(f"num_to_densify_pos: {torch.where(grads >= grad_threshold, True, False).sum()}, num_to_clone_pos: {selected_pts_mask.sum()}")
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -764,8 +791,6 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
-
-        torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, avg_t_grad=None):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

@@ -1,0 +1,96 @@
+# Production profile for the Xuelong posefix scene.
+#
+# CORRECTED 2026-08-17 after re-scoring every run on the full held-out set
+# (docs/experiments/2026-08-17-metric-invalidation-and-rescore.md). The
+# original validation read a held-out metric that scored 3 images out of 300.
+#
+# This profile is a SPEED AND SIZE TRADE, not a free win:
+#   - 1M gaussian budget (#18): 19.96 dB vs 20.32 for the uncapped ship tip —
+#     a 0.36 dB COST, not the +0.2 dB gain it was adopted as. Buys half the
+#     model and most of the wall-time saving.
+#   - GPU-resident image cache (#15): genuinely quality-inert (-0.14 dB,
+#     inside noise) and a large wall-time win. Keep unconditionally.
+#   - Tier-0 fixes incl. once-per-step opacity decay (#7, +0.37 dB): keep.
+#
+# Measured: 18:29 wall for 7,500 iterations at res 2 on one A6000, against
+# ~47 min for the pre-fix code and 32:43 for the uncapped ship tip.
+# Held-out 19.28-19.92 dB on 300 images, i.e. 0.4-1.0 dB below the ship tip.
+#
+# If quality matters more than size or time, drop densify_until_num_points
+# back to 2000000 and expect ~20.3 dB at 32:43.
+#
+# Deliberately NOT included: sqrt-batch LR (#16, neutral); --color_affine
+# (#21, no gain on this rig); --freeze_static_temporal (#20, no effect on any
+# implementation — the whole-clip criterion is structurally unreachable).
+#
+# Paths come from the environment so the profile is not tied to one machine:
+#   FOURC4D_DATASET=.../data/Xuelong/clip_f300_5s_rgb_posefix #   FOURC4D_OUTPUT=.../output/Xuelong/clip_f300_5s_rgb_posefix_production #   python train.py --config configs/custom/xuelong_posefix_production.yaml
+# Everything the validated run used is in this file; no extra flags needed.
+gaussian_dim: 4
+time_duration: [0.0, 5.0]
+num_pts: 75000
+num_pts_ratio: 1.0
+rot_4d: true
+force_sh_3d: false
+batch_size: 4
+exhaust_test: true
+gpu_cache: true
+# No effect on any implementation; see the re-derivation doc.
+freeze_static_temporal: false
+# The eight-camera split the profile was validated on; held out 4 and 6.
+# Without this, eval=true below would train on train.py's default 1,10,13,20
+# and hold out everything else.
+training_view: "0,1,2,3,5,7,8,9"
+
+ModelParams:
+  sh_degree: 3
+  source_path: "${oc.env:FOURC4D_DATASET}"
+  model_path: "${oc.env:FOURC4D_OUTPUT}"
+  images: "images"
+  resolution: 2
+  white_background: false
+  data_device: "cuda"
+  eval: true
+  extension: ".png"
+  num_extra_pts: 0
+  loaded_pth: ""
+  frame_ratio: 1
+  dataloader: true
+
+PipelineParams:
+  convert_SHs_python: false
+  compute_cov3D_python: false
+  debug: false
+  env_map_res: 0
+  env_optimize_until: 1000000000
+  env_optimize_from: 0
+  eval_shfs_4d: true
+
+OptimizationParams:
+  iterations: 7500
+  position_lr_init: 0.00016
+  position_t_lr_init: -1.0
+  position_lr_final: 0.0000016
+  position_lr_delay_mult: 0.01
+  position_lr_max_steps: 7500
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  coefficient_lr: 0.00001
+  coefficient_weight_decay: 0.0001
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  percent_dense: 0.01
+  lambda_dssim: 0.2
+  thresh_opa_prune: 0.005
+  densification_interval: 100
+  opacity_reset_interval: 3000
+  densify_from_iter: 500
+  densify_until_iter: 3500
+  densify_grad_threshold: 0.0002
+  densify_grad_t_threshold: 0.000005
+  densify_until_num_points: 1000000
+  final_prune_from_iter: -1
+  sh_increase_interval: 1000
+  lambda_opa_mask: 0.0
+  lambda_rigid: 0.0
+  lambda_motion: 0.0

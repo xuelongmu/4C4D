@@ -19,6 +19,12 @@ tested one variable at a time.
 
 ## Benchmark protocol (fixed for all experiments)
 
+> Superseded by [`EXPERIMENT_METHODOLOGY.md`](EXPERIMENT_METHODOLOGY.md), which
+> is the protocol as revised by actually running it (two-stage gating, the
+> ±0.4 dB noise band, the two-seed rule, the bisect procedure). The plan below
+> is kept as the campaign's starting position. What it got wrong is recorded in
+> [`LESSONS.md`](LESSONS.md).
+
 - **Scene:** Xuelong clip_f300_5s posefix dataset, seed 42, `--res 2`, 7,500
   iters, batch 4 — identical to `configs/custom/xuelong_clip_f300_5s_rgb_posefix_7500.yaml`.
 - **Standard split:** train `0,1,2,3,5,7,8,9`, held out `4,6` (the existing

@@ -21,6 +21,7 @@ eggs/
 .eggs/
 *.egg
 *.sh
+!scripts/*.sh
 *_log.txt
 4dgs_output_test/
 .zip

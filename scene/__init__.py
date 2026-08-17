@@ -118,6 +118,12 @@ class Scene:
         return CameraDataset(self.test_cameras[scale].copy(), self.white_background)
     
     def getValidationCameras(self, scale=1.0, tag='train', num=100):
+        # `num` is a stride, not a count. The default of 100 subsamples the
+        # 300-image Xuelong held-out set down to THREE images, which is a
+        # high-variance estimator: three same-config runs spread 1.68 dB on it
+        # versus 0.88 dB on the full set, and individual runs carried up to
+        # 0.7 dB of pure measurement error. Callers judging experiments should
+        # pass a stride of 1. See docs/experiments/ and scripts/evaluate_full_heldout.py.
         if tag == 'train':
             return CameraDataset(self.train_cameras[scale][::num], self.white_background)
         elif tag == 'test':

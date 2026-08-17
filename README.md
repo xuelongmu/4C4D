@@ -147,6 +147,11 @@ For calibrated multi-sensor Depthkit/Scatter captures, see the
 [`preprocessing/depthkit`](preprocessing/depthkit/) converter. It undistorts the
 RGB streams, converts the fixed rig calibration to COLMAP convention, and can
 initialize `points3D.txt` from synchronized depth frames.
+[`docs/experiments/2026-08-08-xuelong-depthkit-rgb.md`](docs/experiments/2026-08-08-xuelong-depthkit-rgb.md)
+records the RGB-only preparation workflow end to end — handedness conversion,
+epipolar validation, bundle adjustment, and the camera-count ablation — and
+[Production profile for a calibrated custom rig](#production-profile-for-a-calibrated-custom-rig)
+is the training profile validated on it.
 
 <details>
 <summary><b>Variable Reference</b></summary>
@@ -168,6 +173,106 @@ python train.py \
   --training_view $TRAIN_VIEW \
   --output_dir $OUTPUT_DIR
 ```
+
+The run directory is `ModelParams.model_path` from the config joined with
+`--output_dir`. `train.py` refuses to start if it already exists, and writes the
+fully merged argument set to `<run_dir>/training_params.txt`. Any top-level YAML
+key that names a `train.py` argument overrides that argument's default.
+
+#### Production profile for a calibrated custom rig
+
+`configs/custom/xuelong_posefix_production.yaml` is the validated profile for a
+sparse calibrated multi-camera capture, tuned on a 10-camera Depthkit/Scatter
+rig with two cameras held out. Against the pre-tuning code it trains 7,500
+iterations in **18:29 instead of ~47 min** on one A6000, at equal or better
+held-out quality and half the model size.
+
+The custom configs keep machine paths out of Git by interpolating two
+environment variables into `ModelParams`, so set those rather than editing the
+config:
+
+```bash
+export FOURC4D_DATASET=/path/to/converted-scene   # -> ModelParams.source_path
+export FOURC4D_OUTPUT=/path/to/output-root        # -> ModelParams.model_path
+
+python train.py \
+  --config configs/custom/xuelong_posefix_production.yaml \
+  --output_dir production
+```
+
+The run lands in `$FOURC4D_OUTPUT/production`. The profile is self-contained —
+resolution, split, budget and batch size all come from the config, so no extra
+flags are needed to reproduce the validated run.
+
+An explicitly typed command-line flag outranks the config; a flag left at its
+default does not. That precedence matters here because several flags are
+aliases for config keys with non-`None` defaults (`--res` is 1,
+`--initial_num_pts` is -1, `--weight_decay` is 1e-4). They used to be applied
+unconditionally *after* the merge, silently discarding the config's
+`resolution`, `num_pts` and `coefficient_weight_decay` — which is how two early
+ablations were invalidated by training at full resolution. Older experiment
+docs therefore instruct you to always pass `--res` explicitly; that is no
+longer required, but it remains harmless.
+
+Because top-level YAML keys override `train.py` arguments, each tuned behaviour
+below is config-settable as well as available on the CLI:
+
+| Config key / flag | Production value | Effect |
+| --- | --- | --- |
+| `gpu_cache` / `--gpu_cache` | `true` | decode the whole training set once and keep it as uint8 on the GPU; drops the DataLoader, per-iteration H2D copies and camera deepcopies. Quality-inert, ~17% less wall time. |
+| `freeze_static_temporal` / `--freeze_static_temporal` | `false` | hold the temporal parameters (`t`, `scaling_t`, `rotation_r`) of gaussians whose support spans the whole clip, so background geometry stops churning in time. Briefly adopted on a two-seed win, then withdrawn: those runs predate the implementation fix and are void. Correct now, but not yet validly measured. |
+| `densify_until_num_points` / `--max_num_pts` | `1000000` | hard gaussian budget. Halves model size and wall time; above ~1M this scene only gains train-view fidelity. |
+| `exhaust_test` | `true` | evaluate held-out views on a regular schedule including the final iteration. |
+| `color_affine` / `--color_affine` | off | per-camera 3x4 color affine on the training loss. No gain on this rig (view-dependent SH already absorbed the mismatch); keep for rigs with worse color consistency. |
+
+Both boolean flags accept a negation on the CLI (`--no-gpu_cache`,
+`--no-freeze_static_temporal`) to override the config for an experiment.
+Deliberately *not* enabled: sqrt-batch LR scaling, rejected across three seeds.
+
+The config also pins `training_view` and `resolution`, so the validated split
+and resolution are reproduced without extra flags.
+
+#### Running experiments on the trainer
+
+If you are changing the training loop rather than fitting a scene, follow
+[`docs/EXPERIMENT_METHODOLOGY.md`](docs/EXPERIMENT_METHODOLOGY.md) — the
+two-stage protocol (a ~2-minute smoke gate, then a full held-out A/B) and the
+branch/PR structure used to validate this profile.
+[`docs/LESSONS.md`](docs/LESSONS.md) records what was learned and, more
+usefully, which plausible changes failed and why.
+
+```bash
+# ~2 min: does this change break training?
+scripts/smoke_test.sh my-change 0
+
+# ~20 min/side: does it improve held-out quality? (one per GPU)
+scripts/ab_launch.sh /path/to/control-worktree ab8-control 1 && sleep 10
+scripts/ab_launch.sh /path/to/variant-worktree ab8-variant 0 && sleep 10
+```
+
+Both read `FOURC4D_DATASET` / `FOURC4D_OUTPUT` through the config and honour
+`FOURC4D_PYTHON` when the environment's interpreter is not on `PATH`.
+`ab_launch.sh` additionally honours `FOURC4D_AB_CONFIG` and `FOURC4D_AB_VIEWS`,
+preflights the interpreter and config before backgrounding anything, and copies
+each run's log to `<run_dir>/train.log`.
+
+#### Regenerating the experiment comparison report
+
+`scripts/build_experiment_report.py` scans the run directories under an output
+root for `train.log` and `rendered_images/`, and writes one self-contained HTML
+file: held-out PSNR trajectories, a card per run with the held-out probe render
+(press and hold to flip to ground truth), and a summary table of verdicts.
+
+```bash
+python scripts/build_experiment_report.py \
+  --output-root "$FOURC4D_OUTPUT" \
+  --out /path/outside/the/repo/report.html
+```
+
+Add new experiments as rows in the `RUNS` manifest at the top of the script,
+in commit order, each with its phase and one-line verdict. The report embeds
+capture imagery whose redistribution licensing is not established — write it
+outside the repository and do not host it publicly.
 
 ### 4. Visualization
 

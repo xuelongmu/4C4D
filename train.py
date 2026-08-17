@@ -16,14 +16,14 @@ import random
 import torch
 from torch import nn
 from utils.loss_utils import l1_loss #, ssim, msssim
-from gaussian_renderer import render
+from gaussian_renderer import render, decay_visibility
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, BooleanOptionalAction, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import numpy as np
 from omegaconf import OmegaConf
@@ -44,18 +44,42 @@ except ImportError:
 from datetime import datetime
 
 
+def color_affine_key(image_name):
+    """Camera identity behind a frame's image name, for per-camera color affine.
+
+    Rig captures name frames <camera>_<frame> (cam03_0117), so the trailing
+    frame number is dropped; anything else is used whole.
+    """
+    head, sep, tail = image_name.rpartition('_')
+    return head if sep and tail.isdigit() else image_name
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
 
+    # The regularizer losses behind lambda_opa_mask/lambda_rigid/lambda_motion
+    # are not implemented; the previous vars()-based EMA plumbing silently did
+    # nothing and would raise KeyError if a lambda were nonzero. Fail fast
+    # instead of training something other than what the config claims, and do
+    # it before the logger, model, and scene are built so an invalid config
+    # does not pay the dataset load and CUDA allocations first.
+    unimplemented_lambdas = [key for key in opt.__dict__.keys()
+                             if key.startswith('lambda') and key != 'lambda_dssim'
+                             and opt.__dict__[key] != 0]
+    if unimplemented_lambdas:
+        raise NotImplementedError(
+            f"Losses for {unimplemented_lambdas} are not implemented; set them to 0 "
+            "or implement the corresponding regularizers.")
+
     if dataset.frame_ratio > 1:
         time_duration = [time_duration[0] / dataset.frame_ratio,  time_duration[1] / dataset.frame_ratio]
-    
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     
     if args.opacity_decay:
-        coefficient = Coefficient().cuda()
+        coefficient = Coefficient(hidden_dim=args.hidden_dim, dropout_rate=args.dropout_rate).cuda()
     else:
         coefficient = None
         
@@ -78,13 +102,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
     
     best_psnr = 0.0
+    has_test_views = len(scene.getValidationCameras(tag='test', num=args.val_stride)) > 0
+    if not has_test_views:
+        print("No held-out test views: chkpnt_best.pth will not be written")
     ema_loss_for_log = 0.0
     ema_l1loss_for_log = 0.0
     ema_ssimloss_for_log = 0.0
-    lambda_all = [key for key in opt.__dict__.keys() if key.startswith('lambda') and key!='lambda_dssim']
-    for lambda_name in lambda_all:
-        vars()[f"ema_{lambda_name.replace('lambda_','')}_for_log"] = 0.0
-    
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training", ncols=110)
     first_iter += 1
         
@@ -97,11 +121,109 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
     gaussians.env_map = env_map
     training_dataset = scene.getTrainCameras()
+
+    # Per-camera learnable color affine (3x4: linear color mix + offset),
+    # parameterized as a delta from identity. Multi-camera rigs have per-ISP
+    # color mismatch that otherwise gets absorbed into view-dependent SH.
+    # Applied to the rendered image only when computing the training loss;
+    # evaluation and held-out cameras always use the raw render. The first
+    # training camera is anchored to identity and the rest are weight-decayed
+    # toward it, otherwise the affines form a global color gauge the model
+    # drifts into (raw renders and held-out cameras then mismatch).
+    color_affine_delta = None
+    color_affine_optimizer = None
+    color_affine_index = {}
+    if args.color_affine:
+        # Index by the cameras actually in the training set, not by
+        # args.training_view: the Blender loader ignores that list entirely, and
+        # the Colmap loader only honours it when eval is on, so with the default
+        # eval=False every camera outside the list missed the lookup, fell back
+        # to the never-optimized anchor at index 0, and the feature silently did
+        # nothing.
+        cam_names = sorted({color_affine_key(c.image_name)
+                            for c in training_dataset.viewpoint_stack})
+        color_affine_index = {name: i for i, name in enumerate(cam_names)}
+        if len(cam_names) < 2:
+            print(f"Warning: --color_affine found {len(cam_names)} distinct camera(s) "
+                  f"({cam_names}); every view maps to the identity anchor, so "
+                  "compensation is a no-op for this dataset")
+        color_affine_delta = nn.Parameter(torch.zeros(len(cam_names), 3, 4, device="cuda"))
+        color_affine_optimizer = torch.optim.AdamW(
+            [color_affine_delta], lr=args.color_affine_lr, weight_decay=args.color_affine_weight_decay)
+        color_affine_eye = torch.eye(3, 4, device="cuda")
+
+        # Resuming must continue from the saved compensation, not from identity
+        # with a fresh optimizer, which would abruptly change the training
+        # objective mid-run.
+        if checkpoint:
+            affine_state_path = os.path.join(
+                os.path.dirname(checkpoint) or ".", "color_affine_resume.pth")
+            if os.path.exists(affine_state_path):
+                affine_state = torch.load(affine_state_path)
+                if affine_state['index'] == color_affine_index:
+                    color_affine_delta.data.copy_(affine_state['affine_delta'].cuda())
+                    color_affine_optimizer.load_state_dict(affine_state['optimizer'])
+                    print(f"Restored color affine state from {affine_state_path}")
+                else:
+                    print(f"Warning: {affine_state_path} indexes different cameras "
+                          "than this run; starting color affine from identity")
+            else:
+                print(f"Warning: --color_affine resumed from {checkpoint} but no "
+                      f"{os.path.basename(affine_state_path)} beside it; "
+                      "starting color affine from identity")
     if dataset.dataloader:
         print("\nUsing DataLoader for training dataset")
     else:
         print("\nNot using DataLoader for training dataset")
-    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, 
+    if args.gpu_cache:
+        # Decode every training image once, hold the whole set as uint8 on the
+        # GPU (1500 frames at res 2 is ~4.2 GB), and pre-move the cameras.
+        # Removes the worker pool, per-iteration PNG decode, pageable H2D
+        # copies, and the per-item Camera deepcopy from the hot loop.
+        print("\nBuilding GPU-resident image cache "
+              f"({len(training_dataset)} images)...")
+        from concurrent.futures import ThreadPoolExecutor
+
+        def decode_to_uint8(i):
+            img, cam = training_dataset[i]
+            # Quantize inside the worker so host memory holds one uint8 frame
+            # rather than every decoded float32 frame at once: collecting the
+            # whole set as float32 first peaks at ~4x the final cache size and
+            # can exhaust host RAM before the transfer even starts.
+            img = (img * 255.0).round().to(torch.uint8)
+            # With dataloader=False the camera carries its own decoded float32
+            # image, and Camera.cuda() deepcopies every tensor attribute. Left
+            # in place that would put a second, 4x larger float copy of the same
+            # frame on the GPU beside the cache. The cache owns the pixels now.
+            cam.image = None
+            return img, cam
+
+        with ThreadPoolExecutor(max_workers=8) as pool:  # cv2 decode releases the GIL
+            cached = list(pool.map(decode_to_uint8, range(len(training_dataset))))
+        cache_cameras = [cam.cuda() for _, cam in cached]
+        shapes = {tuple(img.shape) for img, _ in cached}
+        if len(shapes) == 1:
+            # One contiguous allocation when the rig is uniform.
+            gpu_images = torch.stack([img for img, _ in cached]).cuda()
+            cache_bytes = gpu_images.numel()
+            shape_note = f"{tuple(gpu_images.shape)} uint8"
+        else:
+            # Mixed intrinsics give per-camera image sizes, which cannot stack.
+            # The list indexes identically and the render path is per-item.
+            gpu_images = [img.cuda() for img, _ in cached]
+            cache_bytes = sum(img.numel() for img in gpu_images)
+            shape_note = f"{len(gpu_images)} frames, {len(shapes)} distinct sizes, uint8"
+        del cached
+        print(f"GPU image cache: {shape_note}, {cache_bytes / 1e9:.2f} GB")
+
+        def gpu_cache_batches():
+            order = torch.randperm(len(cache_cameras)).tolist()
+            for start in range(0, len(order) - batch_size + 1, batch_size):
+                yield [(gpu_images[j], cache_cameras[j])
+                       for j in order[start:start + batch_size]]
+        training_dataloader = None
+    else:
+        training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True,
                                      num_workers=12 if dataset.dataloader else 0, collate_fn=lambda x: x, drop_last=True)
     
     img_dir = os.path.join(scene.model_path, "rendered_images")
@@ -109,7 +231,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     iteration = first_iter
     while iteration < opt.iterations + 1:
-        for batch_data in training_dataloader:
+        for batch_data in (gpu_cache_batches() if args.gpu_cache else training_dataloader):
             iteration += 1
             if iteration > opt.iterations:
                 break
@@ -129,19 +251,68 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             batch_point_grad = []
             batch_visibility_filter = []
             batch_radii = []
-            
+
+            # Cached cameras already live on the GPU; re-running Camera.cuda()
+            # would deepcopy each one every iteration and undo the cache.
+            batch_cams = [batch_data[i][1] if args.gpu_cache else batch_data[i][1].cuda()
+                          for i in range(batch_size)]
+
+            # Opacity decay, applied exactly once per optimizer step rather than
+            # once per batch item. Each gaussian's decay exponent is the number
+            # of the step's viewpoints that can see it, so the result does not
+            # depend on which camera happens to come first in the shuffled
+            # batch.
+            #
+            # Every render in the step shares the decayed opacity, but each one
+            # backpropagates separately, so the shared tensor is handed to them
+            # as a detached leaf: the per-item backward passes accumulate into
+            # its .grad instead of trying to walk (and free) the one decay
+            # subgraph four times. That subgraph is backpropagated once after
+            # the loop, which is also what carries the render gradients back to
+            # _opacity and the coefficient network.
+            decayed_opacity = None
+            shared_opacity = None
+            if args.opacity_decay and iteration > args.decay_from_iter:
+                if args.time_aware:
+                    visibility_counts = torch.zeros(gaussians.get_xyz.shape[0], 1, device="cuda")
+                    # The temporal covariance is the expensive part of the
+                    # visibility test (build_scaling_rotation_4d plus two
+                    # batched Nx4x4 GEMMs) and is the same for every viewpoint
+                    # in the step, so build it once instead of per camera.
+                    with torch.no_grad():
+                        cov_t = gaussians.get_cov_t()
+                    for cam in batch_cams:
+                        visibility_counts += decay_visibility(
+                            cam, gaussians, pipe, background, cov_t=cov_t).view(-1, 1).float()
+                else:
+                    visibility_counts = batch_size
+                decayed_opacity = gaussians.opacity_decay(
+                    f_min=args.f_min, f_max=args.f_max, power=visibility_counts)
+                shared_opacity = decayed_opacity.detach().requires_grad_(True)
+
             for batch_idx in range(batch_size):
-                gt_image, viewpoint_cam = batch_data[batch_idx]
-                gt_image = gt_image.cuda()
-                viewpoint_cam = viewpoint_cam.cuda()
-                
-                render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration)
+                gt_image, _ = batch_data[batch_idx]
+                viewpoint_cam = batch_cams[batch_idx]
+                if args.gpu_cache:
+                    gt_image = gt_image.to(torch.float32).div_(255.0)
+                else:
+                    gt_image = gt_image.cuda()
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background, args=args, iteration=iteration,
+                                    decayed_opacity=shared_opacity)
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
                 # depth, alpha = render_pkg["depth"], render_pkg["alpha"]
 
-                # Loss
-                Ll1 = l1_loss(image, gt_image)
-                Lssim = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                # Loss (per-camera color affine applies only to the training loss;
+                # eval and held-out renders stay raw; camera 0 is the anchor)
+                affine_idx = color_affine_index.get(color_affine_key(viewpoint_cam.image_name), 0) \
+                    if color_affine_delta is not None else 0
+                if color_affine_delta is not None and affine_idx != 0:
+                    affine = color_affine_eye + color_affine_delta[affine_idx]
+                    image_for_loss = torch.einsum('dc,chw->dhw', affine[:, :3], image) + affine[:, 3][:, None, None]
+                else:
+                    image_for_loss = image
+                Ll1 = l1_loss(image_for_loss, gt_image)
+                Lssim = 1.0 - fast_ssim(image_for_loss.unsqueeze(0), gt_image.unsqueeze(0))
                 loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim
                     
                 loss = loss / batch_size
@@ -150,7 +321,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 batch_point_grad.append(torch.norm(viewspace_point_tensor.grad[:,:2], dim=-1))
                 batch_radii.append(radii)
                 batch_visibility_filter.append(visibility_filter)
-                
+
+            # Chain the batch's accumulated opacity gradient through the decay
+            # subgraph exactly once, reaching _opacity and the coefficient.
+            if shared_opacity is not None and shared_opacity.grad is not None:
+                decayed_opacity.backward(shared_opacity.grad)
+
             if (iteration % 1500 == 0 or iteration == 2):  # Save every 100 iterations
                 # Convert rendered image tensor to numpy and save
                 image = torch.clamp(image, 0.0, 1.0)
@@ -191,26 +367,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             with torch.no_grad():
                 if iteration % 10 == 0:
-                    psnr_for_log = psnr(image, gt_image).mean().double()
-                    # Progress bar
-                    ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                    ema_l1loss_for_log = 0.4 * Ll1.item() + 0.6 * ema_l1loss_for_log
-                    ema_ssimloss_for_log = 0.4 * Lssim.item() + 0.6 * ema_ssimloss_for_log
-                    
-                    for lambda_name in lambda_all:
-                        if opt.__dict__[lambda_name] > 0:
-                            ema = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
-                            vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"] = 0.4 * vars()[f"L{lambda_name.replace('lambda_', '')}"].item() + 0.6*ema
-                            loss_dict[lambda_name.replace("lambda_", "L")] = vars()[lambda_name.replace("lambda_", "L")]
-                            
+                    # One fused D2H transfer instead of four separate syncs
+                    loss_val, l1_val, ssim_val, psnr_val = torch.stack(
+                        [loss.detach(), Ll1.detach(), Lssim.detach(),
+                         psnr(image, gt_image).mean()]).tolist()
+                    ema_loss_for_log = 0.4 * loss_val + 0.6 * ema_loss_for_log
+                    ema_l1loss_for_log = 0.4 * l1_val + 0.6 * ema_l1loss_for_log
+                    ema_ssimloss_for_log = 0.4 * ssim_val + 0.6 * ema_ssimloss_for_log
+
                     postfix = {"Loss": f"{ema_loss_for_log:.{7}f}",
-                                "PSNR": f"{psnr_for_log:.{2}f}",
+                                "PSNR": f"{psnr_val:.{2}f}",
                                 "gs_num":f"{gaussians.get_xyz.shape[0]}"}
-                    
-                    for lambda_name in lambda_all:
-                        if opt.__dict__[lambda_name] > 0:
-                            ema_loss = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
-                            postfix[lambda_name.replace("lambda_", "L")] = f"{ema_loss:.{4}f}"
 
                     progress_bar.set_postfix(postfix)
                     progress_bar.update(10)
@@ -233,9 +400,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # Densification
                 if iteration < opt.densify_until_iter:
-                    # Keep track of max radii in image-space for pruning
-                    gaussians.max_radii2D[visibility_filter] = torch.max(
-                        gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    # max_radii2D feeds only the size_threshold prune, which is
+                    # disabled under opacity_decay; skip the masked max then.
+                    if args.add_size_threshold and not args.opacity_decay:
+                        gaussians.max_radii2D[visibility_filter] = torch.max(
+                            gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                     if batch_size == 1:
                         gaussians.add_densification_stats(viewspace_point_tensor, 
                                     visibility_filter, batch_t_grad if gaussians.gaussian_dim == 4 else None)
@@ -248,28 +417,84 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if args.opacity_decay:
                             size_threshold = None
                         prune_only = opt.densify_until_num_points > 0 and gaussians.get_xyz.shape[0] >= opt.densify_until_num_points
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.thresh_opa_prune, scene.cameras_extent, 
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.thresh_opa_prune, scene.cameras_extent,
                                                     size_threshold, opt.densify_grad_t_threshold, prune_only=prune_only)
+                        # Cloning/splitting appends rows and pruning compacts
+                        # them, so row i is no longer the same gaussian. A
+                        # length check cannot see that when the two happen to
+                        # cancel out, which would freeze unrelated gaussians
+                        # until the next refresh; drop the mask outright.
+                        gaussians.static_mask = None
                     
                     if ((iteration % opt.opacity_reset_interval == 0 and not args.opacity_decay) or (
                         dataset.white_background and iteration == opt.densify_from_iter)) and args.reset_opacity:
                         gaussians.reset_opacity()
                         
+                # Static/dynamic split (lite): gaussians whose temporal marginal
+                # exceeds the render gate at both clip endpoints cover the whole
+                # clip and are effectively static. Holding their temporal
+                # parameters still stops background gaussians from churning in
+                # time, reserving temporal capacity for the performer.
+                #
+                # Known limitation under --rot_4d: get_cov_t builds the temporal
+                # marginal from the full space-time covariance, so _rotation and
+                # _scaling still influence it and are deliberately left
+                # trainable here. This pins the purely temporal parameters, not
+                # the whole temporal support.
+                frozen_rows = None
+                if (args.freeze_static_temporal and gaussians.gaussian_dim == 4
+                        and iteration > opt.densify_from_iter):
+                    sm = gaussians.static_mask
+                    if (iteration % 100 == 0 or sm is None
+                            or sm.shape[0] != gaussians._t.shape[0]):
+                        t0, t1 = gaussians.time_duration
+                        cov_t = gaussians.get_cov_t()
+                        t = gaussians.get_t
+                        m0 = torch.exp(-0.5 * (t - t0) ** 2 / cov_t)[:, 0] > 0.05
+                        m1 = torch.exp(-0.5 * (t - t1) ** 2 / cov_t)[:, 0] > 0.05
+                        sm = gaussians.static_mask = m0 & m1
+                        if iteration % 500 == 0:
+                            print(f"\n[ITER {iteration}] static fraction: "
+                                  f"{sm.float().mean().item():.3f}")
+                    params_t = [gaussians._t, gaussians._scaling_t]
+                    if gaussians.rot_4d:
+                        params_t.append(gaussians._rotation_r)
+                    for p in params_t:
+                        if p.grad is not None:
+                            p.grad[sm] = 0.0
+                    # A zero gradient does not hold these rows still: Adam
+                    # carries first- and second-moment state from before the
+                    # gaussian became static, and keeps stepping on it until
+                    # that momentum decays. Snapshot the frozen rows and put
+                    # them back after the step, which is exact regardless of
+                    # what the optimizer does internally.
+                    frozen_rows = [(p, p.data[sm].clone()) for p in params_t]
+
                 # Optimizer step
                 if iteration < opt.iterations:
                     gaussians.optimizer.step()
+                    if frozen_rows is not None:
+                        with torch.no_grad():
+                            for p, saved in frozen_rows:
+                                p.data[sm] = saved
                     gaussians.optimizer.zero_grad(set_to_none = True)
                     
                     if gaussians.coefficient is not None:
                         gaussians.coef_optimizer.step()
                         gaussians.coef_optimizer.zero_grad(set_to_none = True)
+
+                    if color_affine_optimizer is not None:
+                        color_affine_optimizer.step()
+                        color_affine_optimizer.zero_grad(set_to_none = True)
                         
                     if pipe.env_map_res and iteration < pipe.env_optimize_until:
                         env_map_optimizer.step()
                         env_map_optimizer.zero_grad(set_to_none = True)
                         
-                # Save chkpnt
-                if (iteration in testing_iterations):
+                # Save chkpnt. Without held-out test views there is no metric to
+                # rank checkpoints by, and test_psnr stays 0.0, which would
+                # rewrite chkpnt_best.pth at every test iteration.
+                if (iteration in testing_iterations) and has_test_views:
                     if test_psnr >= best_psnr:
                         best_psnr = test_psnr
                         print("\n[ITER {}] Saving best checkpoint".format(iteration))
@@ -279,6 +504,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
+                    if color_affine_delta is not None:
+                        affine_state = {'index': color_affine_index,
+                                        'affine_delta': color_affine_delta.detach().cpu(),
+                                        'optimizer': color_affine_optimizer.state_dict(),
+                                        'iteration': iteration}
+                        torch.save(affine_state,
+                                   os.path.join(scene.model_path, f"color_affine_{iteration}.pth"))
+                        # Fixed name next to the checkpoints so --start_checkpoint
+                        # can find the matching affine state without being told
+                        # which iteration to look for.
+                        torch.save(affine_state,
+                                   os.path.join(scene.model_path, "color_affine_resume.pth"))
         
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -309,14 +546,13 @@ def training_report(tb_writer, iteration, Ll1, Lssim, loss, l1_loss, elapsed, te
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
         tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
 
     psnr_test_iter = 0.0
     # Report test and samples of training set
     if iteration in testing_iterations:
         validation_configs = (
-            {'name': 'train', 'cameras': scene.getValidationCameras(tag='train')},
-            {'name': 'test', 'cameras': scene.getValidationCameras(tag='test')},
+            {'name': 'train', 'cameras': scene.getValidationCameras(tag='train', num=args.val_stride_train)},
+            {'name': 'test', 'cameras': scene.getValidationCameras(tag='test', num=args.val_stride)},
         )
         
         for config in validation_configs:
@@ -362,8 +598,9 @@ def training_report(tb_writer, iteration, Ll1, Lssim, loss, l1_loss, elapsed, te
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
                 if config['name'] == 'test':
                     psnr_test_iter = psnr_test.item()
-                    
-    torch.cuda.empty_cache()
+        # Only release cached blocks after a full evaluation pass; doing this
+        # every 100 iterations forced a device sync + allocator flush.
+        torch.cuda.empty_cache()
     return psnr_test_iter
 
 def setup_seed(seed):
@@ -409,7 +646,7 @@ if __name__ == "__main__":
                             e.g. '0,1,2'. If not specified, all cameras will be used.")
     
     # opacity decay
-    parser.add_argument("--opacity_decay", action="store_true", default=True)
+    parser.add_argument("--opacity_decay", action=BooleanOptionalAction, default=True)
     parser.add_argument('--f_max', default=0.998, type=float, help='max factor')
     parser.add_argument("--f_min", type=float, default=0.996, help='min factor')
     
@@ -424,40 +661,90 @@ if __name__ == "__main__":
     
     parser.add_argument('--test_per_iter', default=1500, type=int)
     
-    parser.add_argument('--time_aware', action="store_true", default=True)
+    parser.add_argument('--time_aware', action=BooleanOptionalAction, default=True)
+    parser.add_argument('--color_affine', action=BooleanOptionalAction, default=False,
+                        help='learn a per-training-camera 3x4 color affine applied to the training loss')
+    parser.add_argument('--color_affine_lr', type=float, default=1e-4)
+    parser.add_argument('--color_affine_weight_decay', type=float, default=1e-2)
+    parser.add_argument('--val_stride', type=int, default=1,
+                        help='stride over held-out cameras when evaluating; 1 = every '
+                             'image. The old default of 100 scored just 3 of 300 images '
+                             'and could not resolve sub-dB effects')
+    parser.add_argument('--val_stride_train', type=int, default=100,
+                        help='stride over training cameras for the train-view metric')
+    parser.add_argument('--gpu_cache', action=BooleanOptionalAction, default=False,
+                        help='decode all training images once and keep them as uint8 on the GPU')
+    parser.add_argument('--freeze_static_temporal', action=BooleanOptionalAction, default=False,
+                        help='zero temporal gradients of gaussians whose support spans the whole clip')
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
-        
+
+    # Which options were actually typed on the command line. argparse only
+    # fills in a default for a dest that is not already present on the
+    # namespace, so parsing a second time into a namespace pre-seeded with
+    # sentinels leaves every option the command line did not set as the
+    # sentinel. The YAML merge below assigns every configured leaf onto args,
+    # which would otherwise silently discard an explicit flag: with
+    # opacity_decay or time_aware present in the config, --no-opacity_decay
+    # and --no-time_aware had no effect at all.
+    _unset = object()
+    cli_probe = Namespace(**{a.dest: _unset for a in parser._actions if a.dest != "help"})
+    parser.parse_args(sys.argv[1:], namespace=cli_probe)
+    cli_explicit = {dest for dest, value in vars(cli_probe).items() if value is not _unset}
+
     cfg = OmegaConf.load(args.config)
+    cfg_keys = set()
     def recursive_merge(key, host):
         if isinstance(host[key], DictConfig):
             for key1 in host[key].keys():
                 recursive_merge(key1, host[key])
         else:
             assert hasattr(args, key), key
+            cfg_keys.add(key)
+            if key in cli_explicit:
+                return  # an explicit command-line value outranks the config
             setattr(args, key, host[key])
     for k in cfg.keys():
         recursive_merge(k, cfg)
         
     if args.exhaust_test:
-        args.test_iterations = args.test_iterations + [i for i in range(0, op.iterations, args.test_per_iter)]
+        # args.iterations reflects the merged config; op.iterations is the
+        # OptimizationParams class default (30000) regardless of config.
+        # Always include the final iteration: range() excludes its stop, which
+        # silently dropped the end-of-training evaluation.
+        args.test_iterations = args.test_iterations + [i for i in range(0, args.iterations, args.test_per_iter)] + [args.iterations]
         
-    if args.initial_num_pts is not None:
+    # The final iteration is only known after the merge, so append it here.
+    # Appending before the merge recorded the parser default (30000) and left a
+    # profile ending at 7500 with no final save at all.
+    if args.iterations not in args.save_iterations:
+        args.save_iterations.append(args.iterations)
+
+    # These flags are aliases for config keys, and their defaults are non-None
+    # sentinels (initial_num_pts=-1, res=1, weight_decay=1e-4), so applying them
+    # unconditionally overwrote whatever the config had just set: a profile's
+    # num_pts, resolution and coefficient_weight_decay were silently discarded
+    # unless the same value was repeated on the command line. Let the alias
+    # through when it was actually typed, or when the config left that key
+    # alone, so configs that rely on the alias defaults are unaffected.
+    def alias_wins(flag, cfg_key):
+        return flag in cli_explicit or cfg_key not in cfg_keys
+
+    if alias_wins('initial_num_pts', 'num_pts') and args.initial_num_pts is not None:
         args.num_pts = args.initial_num_pts
-                
+
     if args.max_num_pts is not None:
         args.densify_until_num_points = args.max_num_pts
-        
-    if args.res is not None:
+
+    if alias_wins('res', 'resolution') and args.res is not None:
         args.resolution = args.res
-        
+
     if args.output_dir:
         args.model_path = os.path.join(args.model_path, args.output_dir)
-        
-    if args.weight_decay:
+
+    if alias_wins('weight_decay', 'coefficient_weight_decay') and args.weight_decay:
         args.coefficient_weight_decay = args.weight_decay
     
     if os.path.exists(args.model_path):
