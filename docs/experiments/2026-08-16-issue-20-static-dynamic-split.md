@@ -11,10 +11,22 @@ Code: branch `enh/issue-20-static-full`, worktree
 **Result: negative, and consistently so.** The 2.5% frozen fraction was explained
 (§1) and the split raises it to 30% (§4), but every arm loses held-out PSNR, and
 the loss grows monotonically with how much frozen whole-clip background the model
-carries — up to −5.3 dB. A second, unrelated defect turned up on the way: the
-clip is twice as long as the config declares (§2), and correcting it *also* costs
-held-out quality. Nothing here is recommended for adoption; everything is
-flag-gated and off by default so the result is reproducible. See §5.
+carries — up to −4.3 dB on the full held-out set. Nothing here is recommended for
+adoption; everything is flag-gated and off by default so the result is
+reproducible. See §5.
+
+Two further findings, both outside the original scope:
+
+- **The clip is twice as long as the config declares** (§2). Correcting it is
+  probably mildly harmful (−0.62 dB), so the defect is real but should not be
+  fixed naively.
+- **The lite freeze itself shows no held-out benefit once measured on the full
+  held-out set** (§5). PR #40's +0.6–0.7 dB came from a 3-image estimator; a
+  matched seed-44 pair has the freeze *losing* 0.18 dB. Needs settling
+  independently, and if it holds it undercuts the premise of #20.
+
+All PSNRs here were re-scored from checkpoints on the complete 300-image held-out
+set. The training log's own figure covers 3 images.
 
 ## 1. Why the frozen set was 2.5%
 
@@ -176,35 +188,72 @@ an 18× increase. Whether that converts into held-out PSNR is §5.
 
 Base flags: `--max_num_pts 1000000 --gpu_cache --freeze_static_temporal`.
 
-| run | seed | train PSNR | **held-out PSNR** | Δ vs control | final gs | wall |
+**Metric.** All numbers below are `chkpnt7000.pth` re-scored on the **complete
+300-image held-out set** with `scripts/evaluate_full_heldout.py`. The training
+log's own held-out figure comes from `getValidationCameras(num=100)`, which takes
+`test_cameras[::100]` — **3 of 300 images**. Every number in this campaign was
+originally read off that 3-image estimator, and it moved conclusions: the
+control read 21.21 dB on 3 images and 20.34 dB on 300. The 3-image column is
+kept below to show the size of the distortion, not as evidence.
+
+| run | seed | **held-out (300 img)** | Δ vs control mean | SSIM | 3-img (misleading) | final gs |
 |---|---|---|---|---|---|---|
-| `ab8-staticfreeze` (control) | 42 | 27.36 | **21.21** | — | 1,070,964 | ~19 m |
-| `ab8-staticfreeze-s43` (control) | 43 | 27.69 | **20.95** | — | 1,065,485 | ~19 m |
-| `ab8-clipfix` `--fix_clip_bounds` | 42 | 28.31 | **20.16** | −1.05 | 1,024,716 | 21 m |
-| `ab8-clipfix-s43` `--fix_clip_bounds` | 43 | 28.50 | **19.45** | −1.50 | 1,005,427 | 23 m |
-| `ab8-bgsplit-s43` (v1 split) | 43 | 26.52 | **17.81** | −3.14 | 1,037,938 | 22 m |
-| `ab8-bgsplit-pre` (v1 + 1,500-iter median pretrain) | 42 | 24.45 | **18.39** | −2.82 | 1,099,101 | 24 m |
-| `ab8-bgsplit2` (v2 split, frac 0.5) | 42 | 26.31 | **15.89** | −5.32 | 994,614 | 23 m |
-| `ab8-bgsplit2-f20` (v2 split, frac 0.2) | 42 | 26.15 | **16.88** | −4.33 | 1,015,759 | 22 m |
+| `ab8-staticfreeze` (control) | 42 | **20.341** | — | 0.781 | 21.21 | 1,070,964 |
+| `ab8-staticfreeze-s43` (control) | 43 | **20.412** | — | 0.782 | 20.95 | 1,065,485 |
+| `ab8-staticfreeze-s44` (control) | 44 | **20.172** | — | 0.769 | — | — |
+| `ab8-nofreeze-s44` (**no** freeze) | 44 | **20.351** | +0.04 | 0.789 | — | — |
+| `ab8-clipfix` `--fix_clip_bounds` | 42 | **19.885** | −0.42 | 0.776 | 20.16 | 1,024,716 |
+| `ab8-clipfix-s43` `--fix_clip_bounds` | 43 | **19.485** | −0.82 | 0.773 | 19.45 | 1,005,427 |
+| `ab8-bgsplit-s43` (v1 split) | 43 | **17.745** | −2.56 | 0.697 | 17.81 | 1,037,938 |
+| `ab8-bgsplit-pre` (v1 + 1,500-iter median pretrain) | 42 | **18.020** | −2.29 | 0.730 | 18.39 | 1,099,101 |
+| `ab8-bgsplit2` (v2 split, frac 0.5) | 42 | **15.987** | −4.32 | 0.612 | 15.89 | 994,614 |
+| `ab8-bgsplit2-f20` (v2 split, frac 0.2) | 42 | **16.400** | −3.91 | 0.639 | 16.88 | 1,015,759 |
 | `ab8-bgsplit` (v1 split) | 42 | — | — | — | — | OOM-killed |
 
-### `--fix_clip_bounds` is a real fix that makes held-out worse
+Control mean **20.308** over seeds 42/43/44, spread 0.240 dB (sd 0.121) — the
+full-set estimator is roughly an order of magnitude tighter than the 3-image one,
+so sub-dB effects become measurable. All ten runs share identical config
+namespaces (`densify_until_iter=7500`, `densify_until_num_points=1000000`,
+`test_per_iter=1500`), verified from each run's `training_params.txt`.
 
-Both seeds move the same way and by more than the ±0.4 dB noise band: **+0.9 dB
-train, −1.0 to −1.5 dB held-out**. Correcting the temporal initialisation to the
-clip the data actually has widens each gaussian's initial temporal support
-(`cov_t` 1.0 → 1.99) and spreads `t` over the full range, and the model converts
-that extra freedom straight into train-view fit.
+### Unrelated finding: the lite freeze shows no held-out benefit on the full set
 
-This is worth stating plainly: the `time_duration` mismatch of §2 is a genuine
-defect, and the accidental narrow temporal init it produces is *helping* held-out
-quality on this rig. The smoke's +0.8 dB pointed the other way — 700 iterations
-at res 4 is not a proxy for 7,500 at res 2, exactly as the protocol warns.
-**Not adopted.**
+`ab8-staticfreeze-s44` and `ab8-nofreeze-s44` are a matched pair — identical
+config namespaces except `freeze_static_temporal` — and the freeze **loses**:
+20.172 vs **20.351** dB, and 0.769 vs **0.789** SSIM. The three-seed freeze mean
+(20.308) is likewise indistinguishable from that single no-freeze run.
+
+PR #40's headline +0.6–0.7 dB was measured on the 3-image estimator. On the full
+held-out set that gap does not appear. One no-freeze run is not enough to call
+it, and this is outside the scope of this experiment, but it needs settling
+before #40 is merged: two or three more `--no-freeze_static_temporal` runs,
+re-scored on the full set, would do it. Note also that both seed-44 runs predate
+`e52a797`, so they measure the partly-holding freeze.
+
+If it holds, the premise of this whole line of work — including the "raise the
+static fraction to amplify the win" plan in #20 — rests on a measurement
+artifact.
+
+### `--fix_clip_bounds` is a real fix that probably makes held-out slightly worse
+
+On the full set: **19.885 / 19.485 vs a 20.308 control mean, i.e. −0.42 and
+−0.82 dB**, mean −0.62. Both seeds move the same way and train PSNR rises ~0.9 dB,
+so the direction is consistent with converting extra freedom into train-view fit —
+correcting the init widens each gaussian's initial temporal support (`cov_t`
+1.0 → 1.99) and spreads `t` over the full range.
+
+Calibration matters here. The control sd is 0.121 dB (n=3) and the two clipfix
+runs spread 0.283 dB, giving a standard error near 0.21 on the difference, so
+−0.62 dB is roughly 3σ. That is suggestive but rests on n=2 for the variant, and
+it is a much weaker claim than the −1.05/−1.50 dB the 3-image metric appeared to
+show. **Read as: probably mildly harmful, not established.** Either way there is
+no case for adopting it, so it stays off by default with the caveat in its help
+text. The smoke had said +0.8 dB — 700 iterations at res 4 is not a proxy for
+7,500 at res 2, exactly as the protocol warns.
 
 ### The v1 split diluted itself away
 
-−3.14 dB on seed 43, and the background fraction tells the story:
+−2.56 dB against the control mean, and the background fraction tells the story:
 
 ```
 iter 6000 0.024 (24,804 bg / 1,026,887 dyn)   iter 7000 0.022 (24,515 bg / 1,071,946 dyn)
@@ -245,21 +294,23 @@ and an overfit initialisation. **Not adopted.**
 
 v2 holds the background at 29.8% of a 995k population (296,420 background /
 698,194 dynamic) instead of diluting to 2.3%, with none of the `--fix_clip_bounds`
-handicap. It is **−5.32 dB held-out** — worse than v1, which was worse than
-control.
+handicap. It is **−4.32 dB held-out** and **0.612 SSIM against the control's
+0.781** — worse than v1, which was worse than control.
 
 The background layer is not broken. In the best checkpoint the background carries
 *more* weight than the dynamic layer (mean opacity 0.611 vs 0.326, deciles
-reaching 1.000). Train PSNR is 26.31, only 1 dB under control. What collapses is
-generalization:
+reaching 1.000), and its rows are verified bit-exactly frozen. Train PSNR is
+26.31, about 1 dB under control. What collapses is generalization:
 
-| | train | held-out | gap |
+| | train (12 img) | held-out (300 img) | gap |
 |---|---|---|---|
-| control | 27.36 | 21.21 | **6.15** |
-| v2 split | 26.31 | 15.89 | **10.42** |
+| control | 27.36 | 20.341 | **7.02** |
+| v2 split | 26.31 | 15.987 | **10.32** |
 
 `chkpnt_best` for v2 is from **iteration 1,500** — held-out quality peaked at a
-fifth of the run and fell for the remaining 6,000 iterations.
+fifth of the run and fell for the remaining 6,000 iterations. (Train PSNR is
+itself only a 12-image average, `train_cameras[::100]`, so the gap figures are
+indicative rather than precise; the held-out column is the full set.)
 
 ### `bg_static_frac` does not control the background share
 
@@ -268,7 +319,7 @@ v2's 29.8% — the same equilibrium from a 2.5× smaller start. Background
 gaussians are temporally visible in every frame, so they are selected by
 densification consistently while dynamic gaussians only compete when their
 timestamps come up; the final share is set by densification dynamics, not by the
-initial split. Held-out is −4.33 vs −5.32, so the knob moves quality a little
+initial split. Held-out is −3.91 vs −4.32, so the knob moves quality a little
 (via the early trajectory) while barely moving the thing it names.
 
 This matters for the conclusion: the approach cannot be rescued by tuning
@@ -280,16 +331,17 @@ top of one that is already losing.
 
 Ordering every configuration by how much whole-clip frozen background it carries:
 
-| configuration | final background share | held-out Δ vs its seed control |
-|---|---|---|
-| control (lite freeze, incidental) | 2.5% | — |
-| v1 + median pretrain | 1.2% | −2.82 |
-| v1 split | 2.3% | −3.14 |
-| v2 split, frac 0.2 | 28.5% | −4.33 |
-| v2 split, frac 0.5 | 29.8% | −5.32 |
+| configuration | final background share | held-out (300 img) | Δ vs control mean |
+|---|---|---|---|
+| control (lite freeze, incidental) | 2.5% | 20.308 (n=3) | — |
+| v1 + median pretrain | 1.2% | 18.020 | −2.29 |
+| v1 split | 2.3% | 17.745 | −2.56 |
+| v2 split, frac 0.2 | 28.5% | 16.400 | −3.91 |
+| v2 split, frac 0.5 | 29.8% | 15.987 | −4.32 |
 
-The relationship is monotone in the wrong direction, and every arm sits far
-outside the ±0.4 dB noise band. Issue #20's premise — that the lite freeze's
+The relationship is monotone in the wrong direction, and against a control sd of
+0.121 dB every arm is 19σ or more — this conclusion is not sensitive to the
+metric problem that reshaped the sub-dB comparisons. Issue #20's premise — that the lite freeze's
 +0.6–0.7 dB is a down-payment on a larger ceiling reachable by *growing* the
 static set — does not hold here. The evidence says the opposite: the lite result
 worked **because** the set was small and self-selected. Freezing gaussians that
@@ -299,10 +351,10 @@ model forces broad, temporally constant primitives to explain a 5-second clip
 from 8 viewpoints, and they fit the training views' time-averaged appearance in a
 way that does not transfer.
 
-`--fix_clip_bounds` points the same way: widening initial temporal support
-(`cov_t` 1.0 → 1.99) bought +0.9 dB train and −1.0/−1.5 dB held-out. Every
+`--fix_clip_bounds` points the same way, more weakly: widening initial temporal
+support (`cov_t` 1.0 → 1.99) bought +0.9 dB train and −0.62 dB held-out. Every
 change in this round that gave gaussians more temporal reach cost held-out
-quality.
+quality, and the size of the cost tracks how much reach was added.
 
 **Recommendation: do not adopt any arm of the full split.** Keep the lite
 `--freeze_static_temporal` as shipped. The code lands flag-gated and off by
@@ -345,7 +397,12 @@ queue now runs one job at a time. Not a code fault.
 
 ## Follow-ups
 
-0. **Where the held-out gap probably goes next.** Three separate levers here
+0. **Settle whether the lite freeze does anything.** Two or three
+   `--no-freeze_static_temporal` runs on the post-`e52a797` base, re-scored with
+   `scripts/evaluate_full_heldout.py`, against the same number of freeze runs.
+   The one matched pair available has the freeze losing 0.18 dB. This gates
+   whether #40 should merge as a quality win or as a no-op.
+1. **Where the held-out gap probably goes next.** Three separate levers here
    (grow the static set, correct the temporal init, pretrain a background) all
    traded held-out quality for train fit, which is the signature of a
    capacity/regularization problem rather than a representation problem. That
