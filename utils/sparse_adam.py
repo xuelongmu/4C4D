@@ -22,6 +22,7 @@ The CUDA kernel is compiled on first use and cached under
 is actually constructed, i.e. when ``--sparse_adam`` is passed.
 """
 
+import atexit
 import os
 import sys
 import threading
@@ -30,6 +31,14 @@ import torch
 
 _EXT = None
 _EXT_LOCK = threading.Lock()
+
+# Set SPARSE_ADAM_STATS=1 to have the per-parameter step counts reported at exit.
+# A masked step that silently fell back to the dense path for every parameter
+# would still train and still pass every quality check, so it is worth being
+# able to confirm the kernel is the thing doing the work.
+_STATS = {"kernel": 0, "dense_fallback": 0, "no_grad": 0} if os.environ.get("SPARSE_ADAM_STATS") else None
+if _STATS is not None:
+    atexit.register(lambda: print(f"[sparse_adam] step counts: {_STATS}", flush=True))
 
 
 def _load_extension():
@@ -132,6 +141,8 @@ class SparseGaussianAdam(torch.optim.Adam):
 
             for p in group["params"]:
                 if p.grad is None:
+                    if _STATS is not None:
+                        _STATS["no_grad"] += 1
                     continue
                 assert not p.grad.is_sparse, "SparseGaussianAdam does not support sparse gradients"
 
@@ -150,7 +161,11 @@ class SparseGaussianAdam(torch.optim.Adam):
                         or not state["exp_avg"].is_contiguous()
                         or not state["exp_avg_sq"].is_contiguous()):
                     self._dense_param_step(p, state, beta1, beta2, eps, step_size, bias_corr2_sqrt)
+                    if _STATS is not None:
+                        _STATS["dense_fallback"] += 1
                     continue
+                if _STATS is not None:
+                    _STATS["kernel"] += 1
 
                 ext.sparse_adam_step(
                     p.data,
