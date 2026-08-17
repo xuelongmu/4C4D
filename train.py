@@ -102,7 +102,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
     
     best_psnr = 0.0
-    has_test_views = len(scene.getValidationCameras(tag='test')) > 0
+    has_test_views = len(scene.getValidationCameras(tag='test', num=args.val_stride)) > 0
     if not has_test_views:
         print("No held-out test views: chkpnt_best.pth will not be written")
     ema_loss_for_log = 0.0
@@ -551,8 +551,8 @@ def training_report(tb_writer, iteration, Ll1, Lssim, loss, l1_loss, elapsed, te
     # Report test and samples of training set
     if iteration in testing_iterations:
         validation_configs = (
-            {'name': 'train', 'cameras': scene.getValidationCameras(tag='train')},
-            {'name': 'test', 'cameras': scene.getValidationCameras(tag='test')},
+            {'name': 'train', 'cameras': scene.getValidationCameras(tag='train', num=args.val_stride_train)},
+            {'name': 'test', 'cameras': scene.getValidationCameras(tag='test', num=args.val_stride)},
         )
         
         for config in validation_configs:
@@ -666,6 +666,12 @@ if __name__ == "__main__":
                         help='learn a per-training-camera 3x4 color affine applied to the training loss')
     parser.add_argument('--color_affine_lr', type=float, default=1e-4)
     parser.add_argument('--color_affine_weight_decay', type=float, default=1e-2)
+    parser.add_argument('--val_stride', type=int, default=1,
+                        help='stride over held-out cameras when evaluating; 1 = every '
+                             'image. The old default of 100 scored just 3 of 300 images '
+                             'and could not resolve sub-dB effects')
+    parser.add_argument('--val_stride_train', type=int, default=100,
+                        help='stride over training cameras for the train-view metric')
     parser.add_argument('--gpu_cache', action=BooleanOptionalAction, default=False,
                         help='decode all training images once and keep them as uint8 on the GPU')
     parser.add_argument('--freeze_static_temporal', action=BooleanOptionalAction, default=False,
