@@ -92,6 +92,8 @@ held-out at full scale. That is the gate working as designed, not failing.
 ## Stage 2 — the full A/B
 
 ```bash
+export FOURC4D_DATASET=/path/to/converted-scene
+export FOURC4D_OUTPUT=/path/to/output-root
 scripts/ab_launch.sh <worktree_dir> <output_name> <gpu> [extra train.py args...]
 ```
 
@@ -217,11 +219,13 @@ PR, is the durable record of why a change was or was not adopted.
 ## Logs and reporting
 
 - **Every run's log is preserved as `<run_dir>/train.log`**, where `run_dir` is
-  `<ModelParams.model_path>/<output_dir>` from the merged config.
-  `ab_launch.sh` writes to a temporary file while training (the run directory
-  must not exist at launch) and copies it into place at exit. If you launch
-  `train.py` by hand, copy the log in yourself — the report generator reads
-  nothing else.
+  `<ModelParams.model_path>/<output_dir>` from the merged config — for the
+  custom configs that is `$FOURC4D_OUTPUT/<output_dir>`, since they interpolate
+  `${oc.env:FOURC4D_DATASET}` and `${oc.env:FOURC4D_OUTPUT}` rather than
+  committing machine paths. `ab_launch.sh` writes to a temporary file while
+  training (the run directory must not exist at launch) and copies it into
+  place at exit. If you launch `train.py` by hand, copy the log in yourself —
+  the report generator reads nothing else.
 - `train.py` also writes `training_params.txt` (the fully merged argument set)
   into the run directory. That file, not the shell history, is the record of
   what a run actually did.
@@ -229,7 +233,7 @@ PR, is the durable record of why a change was or was not adopted.
 
   ```bash
   python scripts/build_experiment_report.py \
-      --output-root "$FOURC4D_OUTPUT/Xuelong/clip_f300_5s_rgb_posefix" \
+      --output-root "$FOURC4D_OUTPUT" \
       --out /path/outside/the/repo/report.html
   ```
 

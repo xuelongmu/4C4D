@@ -176,7 +176,8 @@ python train.py \
 
 The run directory is `ModelParams.model_path` from the config joined with
 `--output_dir`. `train.py` refuses to start if it already exists, and writes the
-fully merged argument set to `<run_dir>/training_params.txt`.
+fully merged argument set to `<run_dir>/training_params.txt`. Any top-level YAML
+key that names a `train.py` argument overrides that argument's default.
 
 #### Production profile for a calibrated custom rig
 
@@ -184,10 +185,16 @@ fully merged argument set to `<run_dir>/training_params.txt`.
 sparse calibrated multi-camera capture, tuned on a 10-camera Depthkit/Scatter
 rig with two cameras held out. Against the pre-tuning code it trains 7,500
 iterations in **18:29 instead of ~47 min** on one A6000, at equal or better
-held-out quality and half the model size. Point `ModelParams.source_path` and
-`ModelParams.model_path` at your converted scene, then:
+held-out quality and half the model size.
+
+The custom configs keep machine paths out of Git by interpolating two
+environment variables into `ModelParams`, so set those rather than editing the
+config:
 
 ```bash
+export FOURC4D_DATASET=/path/to/converted-scene   # -> ModelParams.source_path
+export FOURC4D_OUTPUT=/path/to/output-root        # -> ModelParams.model_path
+
 python train.py \
   --config configs/custom/xuelong_posefix_production.yaml \
   --res 2 \
@@ -195,11 +202,13 @@ python train.py \
   --training_view 0,1,2,3,5,7,8,9
 ```
 
+The run lands in `$FOURC4D_OUTPUT/production`.
+
 **Always pass `--res` explicitly.** It defaults to 1 and is applied *after* the
 YAML merge, so omitting it silently trains at full resolution.
 
-Any top-level YAML key that names a `train.py` argument overrides it, so the
-tuned behaviour below is config-settable as well as available on the CLI:
+Because top-level YAML keys override `train.py` arguments, each tuned behaviour
+below is config-settable as well as available on the CLI:
 
 | Config key / flag | Production value | Effect |
 | --- | --- | --- |
@@ -231,9 +240,11 @@ scripts/ab_launch.sh /path/to/control-worktree ab8-control 1 && sleep 10
 scripts/ab_launch.sh /path/to/variant-worktree ab8-variant 0 && sleep 10
 ```
 
-Both scripts honour `FOURC4D_PYTHON`; `ab_launch.sh` additionally honours
-`FOURC4D_AB_CONFIG` and `FOURC4D_AB_VIEWS`, and copies each run's log to
-`<run_dir>/train.log`.
+Both read `FOURC4D_DATASET` / `FOURC4D_OUTPUT` through the config and honour
+`FOURC4D_PYTHON` when the environment's interpreter is not on `PATH`.
+`ab_launch.sh` additionally honours `FOURC4D_AB_CONFIG` and `FOURC4D_AB_VIEWS`,
+preflights the interpreter and config before backgrounding anything, and copies
+each run's log to `<run_dir>/train.log`.
 
 #### Regenerating the experiment comparison report
 
@@ -244,8 +255,8 @@ file: held-out PSNR trajectories, a card per run with the held-out probe render
 
 ```bash
 python scripts/build_experiment_report.py \
-  --output-root $OUTPUT_ROOT/Xuelong/clip_f300_5s_rgb_posefix \
-  --out $REPORT_DIR/report.html
+  --output-root "$FOURC4D_OUTPUT" \
+  --out /path/outside/the/repo/report.html
 ```
 
 Add new experiments as rows in the `RUNS` manifest at the top of the script,
