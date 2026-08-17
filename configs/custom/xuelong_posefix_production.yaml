@@ -1,18 +1,30 @@
-# Production profile for the Xuelong posefix scene, validated 2026-08-10/11
-# (docs/experiments/2026-08-10-enhancement-experiments.md):
-#   - 1M gaussian budget: held-out PSNR parity with the 2M baseline
-#     (+0.1..0.2 dB), half the model size (#18)
-#   - GPU-resident image cache: quality-inert, large wall-time win (#15)
-#   - once-per-step opacity decay (#7) and Tier-0 fixes are in the code
-# Measured: 18:29 wall for 7500 iters at res 2 on one A6000 (vs ~47 min
-# pre-fix), held-out 20.48-20.61 dB on the 8-camera split.
-# Deliberately NOT included: sqrt-batch LR scaling (#16) pending multi-seed
-# confirmation; --color_affine (no gain on this rig, #21).
+# Production profile for the Xuelong posefix scene.
+#
+# CORRECTED 2026-08-17 after re-scoring every run on the full held-out set
+# (docs/experiments/2026-08-17-metric-invalidation-and-rescore.md). The
+# original validation read a held-out metric that scored 3 images out of 300.
+#
+# This profile is a SPEED AND SIZE TRADE, not a free win:
+#   - 1M gaussian budget (#18): 19.96 dB vs 20.32 for the uncapped ship tip —
+#     a 0.36 dB COST, not the +0.2 dB gain it was adopted as. Buys half the
+#     model and most of the wall-time saving.
+#   - GPU-resident image cache (#15): genuinely quality-inert (-0.14 dB,
+#     inside noise) and a large wall-time win. Keep unconditionally.
+#   - Tier-0 fixes incl. once-per-step opacity decay (#7, +0.37 dB): keep.
+#
+# Measured: 18:29 wall for 7,500 iterations at res 2 on one A6000, against
+# ~47 min for the pre-fix code and 32:43 for the uncapped ship tip.
+# Held-out 19.28-19.92 dB on 300 images, i.e. 0.4-1.0 dB below the ship tip.
+#
+# If quality matters more than size or time, drop densify_until_num_points
+# back to 2000000 and expect ~20.3 dB at 32:43.
+#
+# Deliberately NOT included: sqrt-batch LR (#16, neutral); --color_affine
+# (#21, no gain on this rig); --freeze_static_temporal (#20, no effect on any
+# implementation — the whole-clip criterion is structurally unreachable).
 #
 # Paths come from the environment so the profile is not tied to one machine:
-#   FOURC4D_DATASET=.../data/Xuelong/clip_f300_5s_rgb_posefix \
-#   FOURC4D_OUTPUT=.../output/Xuelong/clip_f300_5s_rgb_posefix_production \
-#   python train.py --config configs/custom/xuelong_posefix_production.yaml
+#   FOURC4D_DATASET=.../data/Xuelong/clip_f300_5s_rgb_posefix #   FOURC4D_OUTPUT=.../output/Xuelong/clip_f300_5s_rgb_posefix_production #   python train.py --config configs/custom/xuelong_posefix_production.yaml
 # Everything the validated run used is in this file; no extra flags needed.
 gaussian_dim: 4
 time_duration: [0.0, 5.0]
@@ -23,13 +35,7 @@ force_sh_3d: false
 batch_size: 4
 exhaust_test: true
 gpu_cache: true
-# freeze_static_temporal: PROVISIONALLY DISABLED 2026-08-16.
-# It was adopted on a two-seed +0.6-0.7 dB win, but those runs used the
-# pre-d8a7d29 implementation in which zeroed gradients did not actually hold
-# parameters (Adam momentum kept stepping them) and stale masks could pin
-# unrelated gaussians after densification. Those measurements are void, not
-# merely weak. Re-enable only after a paired A/B on the fixed implementation
-# shows a win across three seeds. See docs/experiments/.
+# No effect on any implementation; see the re-derivation doc.
 freeze_static_temporal: false
 # The eight-camera split the profile was validated on; held out 4 and 6.
 # Without this, eval=true below would train on train.py's default 1,10,13,20
