@@ -108,19 +108,32 @@ accepts, but it is a real change, not purely an optimisation.
 
 ### Interaction with opacity decay
 
-The neural opacity decay writes `_opacity.data` in place once per step, gated
-by `torch.where(mask, decayed, old)` where the mask is the frustum-and-temporal
-visibility of batch item 0 only. Most decayed rows are therefore also inside
-the union `radii > 0` mask that drives the Adam step, and their optimizer state
-stays consistent.
+The neural opacity decay writes `_opacity.data` in place once per step. It no
+longer uses a boolean mask: `decay_visibility` counts, per gaussian, how many of
+the batch's viewpoints see it (`markVisible` ∧ temporal marginal), and that count
+is the exponent on the decay factor, so a gaussian seen by no viewpoint gets
+`factor ** 0 = 1` and is left alone.
 
-The two masks are not nested, though: `markVisible` is a frustum test, so a
-gaussian can be in frustum for view 0 (decayed) yet have `radii == 0` in every
-view of the batch (not Adam-stepped). Those gaussians have their opacity
-changed while their moments freeze, where the dense path would have applied a
-momentum-only step. They are by construction sub-pixel or degenerate gaussians,
-so no correction was made; recorded here because it is not obvious from the
-code.
+The decay's visibility and the Adam mask are still not nested. `markVisible` is
+a frustum test while the Adam mask is the union of `radii > 0`, so a gaussian can
+be counted visible (decayed) yet have `radii == 0` in every view of the batch
+(not Adam-stepped). Those gaussians have their opacity changed while their
+moments freeze, where the dense path would have applied a momentum-only step.
+They are by construction sub-pixel or degenerate gaussians, so no correction was
+made; recorded because it is not obvious from the code.
+
+Note also that `_opacity.data` is rewritten for every row, including rows the
+count leaves undecayed, so all gaussians take a `sigmoid`/`inverse_sigmoid`
+round-trip each step. That perturbation is identical in both arms and predates
+this change.
+
+### Interaction with the static temporal freeze
+
+`--freeze_static_temporal` snapshots the frozen rows before the step and restores
+them afterwards, which is exact regardless of what the optimizer did internally.
+It therefore composes with the masked step without modification: a static row the
+batch never touched was not stepped at all, and the restore is a no-op for it.
+Both arms of the A/B below run with the freeze on.
 
 ## Implementation
 
@@ -132,17 +145,23 @@ code.
   pruning surgery on `optimizer.state`, and existing checkpoints, keep working.
   The extension is JIT-built on first use and cached, so `--sparse_adam` costs
   nothing when off.
-- Two fallbacks to a dense step, both exercised by the tests:
+- Two fallbacks to a dense step, both covered by the tests:
   - **Stale mask.** `densify_and_prune` runs *before* `optimizer.step()`, so on
-    densification iterations the mask is shorter than N. Those parameters were
-    just rebuilt by `torch.cat` and carry no gradient, so the step is a no-op
-    either way.
+    densification iterations the mask is shorter than N. In practice this
+    fallback never fires during training: those parameters were just rebuilt by
+    `torch.cat` and carry no gradient, so the earlier `p.grad is None` check
+    short-circuits first. It is defensive, and the unit test drives it directly.
   - **Non-row-major parameters.** `fetchPly` builds positions as
     `np.vstack([x, y, z]).T`, so `_xyz` arrives F-contiguous (stride `(1, N)`)
     and stays that way until the first densification `cat` replaces it. The
     optimizer relays such parameters out at construction. This is a pre-existing
     quirk worth a separate look: for the first ~500 iterations every rasterizer
     call has to re-lay-out `_xyz` as well.
+- `SPARSE_ADAM_STATS=1` reports kernel / dense-fallback / skipped step counts at
+  exit. A masked step that quietly fell back to dense for every parameter would
+  still train and still pass every quality check, so confirming the kernel did
+  the work is worth a counter. Over a 700-iteration smoke: **6,246 kernel steps,
+  zero fallbacks**, and 54 skips (six densification events x nine parameters).
 - `ninja` added to `environment.yml`; the JIT build needs it, and the failure
   is otherwise reported as an opaque torch error.
 
