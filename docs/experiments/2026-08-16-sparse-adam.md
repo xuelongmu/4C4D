@@ -5,9 +5,9 @@ Date: 2026-08-16
 Issue: [#17](https://github.com/xuelongmu/4C4D/issues/17). Branch:
 `enh/issue-17-sparse-adam`, stacked on `pr/issue-20-static-freeze`.
 
-Status: complete. On a certified-idle box, `--sparse_adam` is 7.7% faster end to
-end (11.1% per iteration at the 1M-point plateau) with held-out quality
-unchanged.
+Status: complete. On a certified-idle box, `--sparse_adam` is **9.0% faster end
+to end** (13.5% per iteration at the 1M-point plateau), with no measurable change
+in full-set held-out quality (mean +0.02 dB over three A/B pairs, sign flipping).
 
 ## Objective
 
@@ -20,9 +20,13 @@ saving at 2M gaussians. Measure what the technique is actually worth on the
 ## Environment
 
 - WSL2 Ubuntu-22.04, Python 3.10, PyTorch 2.1.2+cu118, CUDA 11.8.
-- Two NVIDIA RTX A6000. Both cards were shared with another session throughout;
-  absolute wall times below are contended and are only compared within a
-  measurement, never across.
+- Two NVIDIA RTX A6000, shared with other sessions. Microbenchmarks below were
+  taken under contention and are only compared within a table, never across.
+  The A/B pairs of record were gated on an idle box and sampled throughout to
+  prove it stayed idle.
+- Quality is scored with `scripts/evaluate_full_heldout.py --stride 1` over all
+  300 held-out images. The training log's own held-out line is
+  `test_cameras[::100]` = 3 images and is not used for any result here.
 - Config `configs/custom/xuelong_clip_f300_5s_rgb_posefix_7500.yaml`, `--res 2`,
   training views `0,1,2,3,5,7,8,9`, `--max_num_pts 1000000 --gpu_cache
   --freeze_static_temporal`, seed 42.
@@ -189,106 +193,124 @@ convergence cost of masking while collecting almost none of the speedup that
 only appears near the 1M-point cap. The full-scale A/B is the decisive test.
 
 The full-scale runs settled it: the apparent 0.5 dB smoke deficit was noise.
-Across four full runs the same-seed held-out spread is 0.38 dB on its own, and
-sparse ends level or ahead of dense in both pairs. **The smoke test cannot gate
-this flag** — it is under-powered against its own noise, and it never reaches
-the point where the change does anything.
+**The smoke test cannot gate this flag** — it never reaches the point where the
+change does anything, and its held-out number is `test_cameras[::100]`, which on
+this split is a handful of images (see the metric warning below).
 
 ## Full-scale A/B
 
-Both arms from this branch, 7,500 iterations, seed 42, flags as in
-"Environment": `ab17-dense` (no flag) against `ab17-sparse` (`--sparse_adam`),
-run back to back on one GPU.
+Three A/B pairs were run, all 7,500 iterations at seed 42 with the flags in
+"Environment", each pair back to back on one GPU:
 
-Two batches were run, because the first one's dense arm was contended:
+| pair | base revision | box | use |
+|---|---|---|---|
+| `ab17-*` | pre-merge | contended by another session through the dense arm | quality sample only; timings discarded |
+| `ab17c-*` | pre-merge | gated idle, `others=0` sampled throughout | pre-merge timing of record |
+| `ab17m-*` | merged (this branch) | gated idle, `others=0` sampled throughout | **timing of record** |
 
-- **Batch 1** (`ab17-dense` / `ab17-sparse`) — another session was training on
-  both cards through the dense arm. Its timings are unusable; its quality
-  numbers are kept only as a second sample.
-- **Batch 2** (`ab17c-dense` / `ab17c-sparse`) — gated on `pgrep -af train.py`
-  returning no foreign process, with a 30-second sampler that recorded
-  `others=0` for the whole of both arms. This is the measurement of record.
+The third pair exists because the base branch advanced 16 commits mid-experiment,
+including a corrected static-temporal freeze, a rewritten once-per-step opacity
+decay, and `4e324a1`, which hoists the temporal covariance out of the
+per-viewpoint loop. That last one makes every iteration cheaper, so it changes
+the denominator of any percentage claim. Carrying a number across a base change
+like that is not sound, so both arms were re-run on the merged revision.
 
-### Speed: 7.7% total, 11.1% at the plateau
+### Speed: 9.0% end to end, 13.5% at the plateau
 
-Batch 2, certified idle: **dense 19:10 (1,150 s), sparse 17:42 (1,062 s) — 7.7%
-faster.** Per-1,000-iteration segments:
+Merged base, certified idle: **dense 19:36 (1,176 s) against sparse 17:50
+(1,070 s) — 9.0% faster.** Per-1,000-iteration segments:
 
 | segment | dense | sparse | delta |
 |---|---|---|---|
-| 0-1,000 | 154 s | 155 s | +1 s |
-| 1,000-2,000 | 106 s | 103 s | -3 s |
-| 2,000-3,000 | 144 s | 131 s | -13 s |
-| 3,000-4,000 | 163 s | 145 s | -18 s |
-| 4,000-5,000 | 160 s | 150 s | -10 s |
-| 5,000-6,000 | 157 s | 139 s | -18 s |
-| 6,000-7,000 | 165 s | 145 s | -20 s |
+| 0-1,000 | 147 s | 151 s | +4 s |
+| 1,000-2,000 | 109 s | 107 s | -2 s |
+| 2,000-3,000 | 156 s | 135 s | -21 s |
+| 3,000-4,000 | 173 s | 148 s | -25 s |
+| 4,000-5,000 | 168 s | 149 s | -19 s |
+| 5,000-6,000 | 160 s | 140 s | -20 s |
+| 6,000-7,000 | 167 s | 147 s | -20 s |
 
-**The saving appears exactly where the mechanism predicts it.** The first two
-segments are identical to within a second or two — N is small there and the
-Adam step is ~2% of an iteration — and the gap opens as densification drives N
-up and the visible fraction down. Over the 1M-point plateau (iterations
-4,000-7,000) the arms take 482 s against 434 s, **11.1% faster per iteration**.
-Batch 1's plateau window gave 11.3% independently, so the two batches agree on
-the part of batch 1 that was not contended.
+Over the 1M-point plateau (iterations 4,000-7,000) the arms take 495 s against
+436 s, **13.5% faster per iteration**.
 
-For reference, batch 2's dense arm (19:10) lands 1.6% off the historical
-`ab8-staticfreeze` control (18:52), but the same-revision arm above is the
-control this claim rests on, not that historical number.
+Three things make this attributable to the masked step rather than to anything
+else:
 
-The result is well short of the issue's 20-40% estimate, for the reason given
-above: the Adam step was never more than ~10% of an iteration here, so ~10% was
-the ceiling.
+1. **The first two thousand iterations are a wash** (256 s against 258 s). N is
+   small there and the Adam step is ~2% of an iteration, so the mechanism
+   predicts no saving, and none appears. The gap opens only as densification
+   drives N up and the visible fraction down.
+2. **The sparse arm carries a slightly larger model, not a smaller one.** At
+   iteration 7,000 the checkpoints hold 995,421 gaussians (dense) against
+   1,035,672 (sparse) — sparse is 4.0% *bigger*, so the win is not a
+   fewer-gaussians artifact; if anything that works against it.
+3. **The kernel really did the work.** `SPARSE_ADAM_STATS=1` over the full run:
+   66,861 kernel steps, **zero dense fallbacks**, 621 skips (parameters rebuilt
+   by densification, which carry no gradient).
 
-### Quality: unchanged
+The pre-merge pair gave 7.7% end to end and 11.1% at the plateau. Both figures
+are lower than the merged base's because the base's own optimisations had not
+landed yet: cheaper iterations make the Adam step a larger share of what is
+left, so removing it buys more.
 
-Held-out PSNR at iteration 7,000, all four runs:
+This is still well short of the issue's 20-40% estimate, for the reason
+established above — the Adam step is ~10% of a plateau iteration, so ~10% was
+always the ceiling on total wall clock. The 13.5% plateau figure exceeds that
+ceiling slightly because the fused kernel also beats torch's multi-pass
+`foreach` step on the visible rows, not only on the masked-out ones.
 
-| | dense | sparse |
-|---|---|---|
-| batch 1 | 20.919 | 20.954 |
-| batch 2 (clean) | 20.539 | 20.805 |
-| mean | 20.729 | 20.880 |
+### Quality: no measurable difference
 
-Sparse is ahead in both pairs, by +0.035 and +0.27 dB, mean +0.15 dB — inside
-the ±0.4 dB band. Held-out quality is preserved. No `--seed 43` replication was
-run, because it did not move.
+**Metric warning.** The `Evaluating test` line in a training log comes from
+`getValidationCameras(tag='test', num=100)`, i.e. `test_cameras[::100]`, which on
+the Xuelong 8-camera split is **3 images out of 300**. Every held-out number in
+an earlier revision of this document came from there and none of them should be
+trusted. The figures below re-score the saved iteration-7,000 checkpoints against
+all 300 held-out images with `scripts/evaluate_full_heldout.py --stride 1`.
 
-Note the same-seed, same-code spread: the dense arm returned 20.919 and 20.539
-in two runs, 0.38 dB apart. **The ±0.4 dB noise band applies at fixed seed**,
-because the rasterizer backward accumulates with nondeterministic atomics. Final
-gaussian counts agree within ~1% in both batches.
+Full held-out set, 300 images, iteration 7,000:
 
-Train PSNR is consistently lower for sparse (27.292 against 26.608 in batch 1,
-27.691 against 26.778 in batch 2), by 0.68-0.91 dB, while held-out is level or
-better. Sparse Adam fits the training views less tightly without costing
-generalisation, which is consistent with masking acting as a mild regulariser.
-Two samples per arm make that an observation, not a claim.
+| pair | dense PSNR | sparse PSNR | delta | dense SSIM | sparse SSIM |
+|---|---|---|---|---|---|
+| `ab17m` (merged) | 20.090 | 20.264 | **+0.173** | 0.7770 | 0.7801 |
+| `ab17c` (pre-merge) | 20.336 | 20.077 | **-0.260** | 0.7819 | 0.7774 |
+| `ab17` (pre-merge) | 20.516 | 20.662 | **+0.147** | 0.7797 | 0.7875 |
+| mean | 20.314 | 20.334 | **+0.020** | 0.7795 | 0.7817 |
+
+**The sign flips across pairs, so there is no measurable quality difference.**
+Mean delta is +0.02 dB across three pairs. For scale, two runs of the *same* code
+at the *same* seed (`ab17-dense` and `ab17c-dense`) differ by 0.18 dB on this
+metric, because the rasterizer backward accumulates with nondeterministic
+atomics. Three pairs cannot resolve a difference smaller than roughly 0.2 dB, and
+the observed spread is inside that.
+
+For contrast, the 3-image metric reported +0.24 dB for the same `ab17m` pair
+where the full set says +0.17, and it reported sparse *ahead* in the `ab17c` pair
+where the full set says it is 0.26 dB *behind*. The 3-image estimator inverted a
+sign.
+
+Held-out quality is preserved. No seed-43 replication was run: with the effect
+this far inside the noise floor, more seeds would buy precision on a quantity
+that is not distinguishable from zero.
 
 ### Retracted: the "slower mid-run convergence" finding
 
 An earlier revision of this document reported that sparse trails dense by
 0.27-0.39 dB from iteration 3,000 through 6,000, and concluded that
-`--sparse_adam` is not a free speedup on a shortened schedule. **That does not
-reproduce and is withdrawn.** Held-out PSNR by iteration, both batches:
+`--sparse_adam` is not a free speedup on a shortened schedule. **That is
+withdrawn on two independent grounds:**
 
-| iteration | dense b1 | sparse b1 | dense b2 | sparse b2 |
-|---|---|---|---|---|
-| 1,500 | 19.730 | 19.716 | 19.322 | 19.311 |
-| 3,000 | 20.481 | 20.148 | 19.868 | 19.914 |
-| 4,500 | 20.819 | 20.553 | 20.229 | 20.428 |
-| 6,000 | 21.005 | 20.620 | 20.496 | 20.540 |
-| 7,000 | 20.919 | 20.954 | 20.539 | 20.805 |
+1. Every number in it was the 3-image training-log metric, which above is shown
+   to invert signs on differences of this size.
+2. It came from the pair whose dense arm was contended, and the trend reverses in
+   the clean pairs.
 
-In batch 1 sparse trails through the middle; in the clean batch 2 it leads at
-every checkpoint. The deficit was one contended pair, not a property of the
-method — plausibly because contention changes the scheduling that drives the
-rasterizer's nondeterministic accumulation order. Given a 0.38 dB same-seed
-spread, mid-run differences of this size are not resolvable with two samples per
-arm either way.
+It also cannot be re-measured from what was saved: only `chkpnt7000.pth` and
+`chkpnt_best.pth` are written, so there are no mid-run checkpoints to re-score
+against the full held-out set. **The mid-run trajectory is simply unmeasured.**
 
-The mechanism-level prediction that motivated the claim (freezing untouched
-gaussians should slow convergence) remains reasonable, and the unit test
-confirms those gaussians really are frozen. It is simply not visible above the
-noise at this scale. Anyone wanting to early-stop should measure it directly
-rather than trust either direction reported here.
+The mechanism-level prediction behind the claim — that freezing gaussians the
+batch did not touch should slow convergence — remains reasonable, and the unit
+test confirms those gaussians really are frozen. It is just not established by
+anything here. Anyone wanting to early-stop should save mid-run checkpoints and
+score them on the full set.
