@@ -15,10 +15,15 @@
 # training: train.py refuses to start if the run directory already exists.)
 #
 # Usage:
+#   export FOURC4D_DATASET=/path/to/converted-scene
+#   export FOURC4D_OUTPUT=/path/to/output-root
 #   scripts/ab_launch.sh <worktree_dir> <output_name> <gpu> [extra train.py args...]
 #
+# The custom configs interpolate those two variables into ModelParams; they are
+# inherited by the detached child, so export them rather than prefixing them.
+#
 # Environment:
-#   FOURC4D_PYTHON      interpreter to use            (default: python)
+#   FOURC4D_PYTHON      interpreter for the 4c4d env  (default: python, then python3)
 #   FOURC4D_AB_CONFIG   config path, relative to cwd
 #                       (default: configs/custom/xuelong_posefix_production.yaml)
 #   FOURC4D_AB_VIEWS    training views                (default: 0,1,2,3,5,7,8,9)
@@ -50,20 +55,36 @@ GPU=${3:?gpu index}
 EXTRA=("${@:4}")
 
 SELF=$(readlink -f "$0")
-PY=${FOURC4D_PYTHON:-python}
 VIEWS=${FOURC4D_AB_VIEWS:-0,1,2,3,5,7,8,9}
 LOGDIR=${FOURC4D_AB_LOGDIR:-/tmp}
 CFG=$(readlink -f "${FOURC4D_AB_CONFIG:-configs/custom/xuelong_posefix_production.yaml}")
 
+PY=${FOURC4D_PYTHON:-$(command -v python || command -v python3 || true)}
+
 [[ -f "$CFG" ]] || { echo "config not found: $CFG" >&2; exit 1; }
 [[ -d "$WT" ]]  || { echo "worktree not found: $WT" >&2; exit 1; }
 
-MODEL_PATH=$("$PY" - "$CFG" <<'PY'
+# Preflight the interpreter here rather than in the detached child: without
+# this, a wrong or missing interpreter fails inside nohup, the launcher still
+# prints "launched", and the only trace is a line in a log nobody reads yet.
+if [[ -z "$PY" ]] || ! "$PY" -c 'import torch, omegaconf' 2>/dev/null; then
+  echo "no usable interpreter (tried: ${PY:-none})." >&2
+  echo "Activate the 4c4d environment, or set FOURC4D_PYTHON to its python." >&2
+  exit 1
+fi
+
+MODEL_PATH=$("$PY" - "$CFG" 2>/dev/null <<'PY'
 import sys
 from omegaconf import OmegaConf
 print(OmegaConf.load(sys.argv[1]).ModelParams.model_path)
 PY
-)
+) || true
+if [[ -z "$MODEL_PATH" ]]; then
+  echo "could not resolve ModelParams.model_path from $CFG" >&2
+  echo 'The custom configs interpolate ${oc.env:FOURC4D_DATASET} and' >&2
+  echo '${oc.env:FOURC4D_OUTPUT}; export both before launching.' >&2
+  exit 1
+fi
 RUN_DIR="$MODEL_PATH/$OUT"
 [[ -e "$RUN_DIR" ]] && { echo "run dir already exists: $RUN_DIR" >&2; exit 1; }
 
