@@ -62,7 +62,16 @@ def decay_visibility(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.
         space_visibility = rasterizer.markVisible(pc.get_xyz)
         time_visibility = pc.get_marginal_t(
             viewpoint_camera.timestamp, cov_t=cov_t)[:, 0] > 0.05
-        return space_visibility & time_visibility
+        visibility = space_visibility & time_visibility
+        if getattr(pc, "_is_static", None) is not None:
+            # --bg_static_split: decay exists to cull gaussians that only matter
+            # at some timestamps. A background gaussian is temporally visible at
+            # every timestamp by construction, so counting it here would decay
+            # it on every viewpoint of every step -- roughly 14x more often than
+            # a typical dynamic gaussian, which wiped the background out within a
+            # few hundred iterations. A count of 0 leaves its opacity untouched.
+            visibility = visibility & ~pc._is_static
+        return visibility
 
 
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, override_color=None, args=None, iteration=-1, decayed_opacity=None):
