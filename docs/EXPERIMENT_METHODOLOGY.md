@@ -15,12 +15,16 @@ tutorial: it assumes the training commands in `README.md` already work.
 
 | Stage | Cost | Gates | Cannot see |
 | --- | --- | --- | --- |
+| Mechanism check (assertion / unit test) | minutes | *the change does what its name says* | whether it helps |
 | Smoke (`scripts/smoke_test.sh`) | ~2 min | crashes, collapses, obvious perf cliffs | anything under ~0.4 dB; all late-training dynamics |
-| Full A/B (`scripts/ab_launch.sh`) | ~20-35 min/side | held-out quality, wall time, model size | seed-level noise below ~0.4 dB |
-| Two-seed replication | 2x full A/B | sampling luck | systematic bias shared by both seeds |
+| Full A/B (`scripts/ab_launch.sh`) | ~20-35 min/side | held-out quality, wall time, model size | whether the arm measured the intended feature |
+| Multi-seed replication | 2-3x full A/B | sampling luck | a treatment arm that is broken in every seed |
 
 No quality claim may rest on a smoke run. No sub-1 dB adoption may rest on a
-single seed.
+single seed. **And no A/B is interpretable until the mechanism check has
+passed** — the campaign's headline quality win turned out to be a feature that
+was only ~8% effective plus a random per-seed perturbation, replicated across
+two seeds before anyone checked that it did anything (`LESSONS.md` §7).
 
 ## The fixed benchmark
 
@@ -34,10 +38,14 @@ remain comparable. Change it only with a documented reason.
   The secondary stress split is train `0,1,2,5,8,9`, held out `3,4,6,7`.
   The 10-camera all-train configuration has **no held-out metric** and is a
   production fit, never an experiment.
-- **Resolution:** `--res 2`, always passed explicitly. `train.py` defaults
-  `--res` to 1 and applies it after the YAML merge, so omitting it silently
-  changes the experiment to full resolution. Two early ablations were
-  invalidated this way.
+- **Resolution:** res 2. This used to require passing `--res 2` explicitly on
+  every command — the flag defaults to 1 and was applied *after* the YAML
+  merge, so omitting it silently trained at full resolution and invalidated two
+  early ablations. `train.py` now gives an explicitly typed flag precedence over
+  the config and only applies alias defaults (`--res`, `--initial_num_pts`,
+  `--weight_decay`) when the config leaves that key alone, so a config with
+  `resolution: 2` is safe on its own. The older experiment docs still carry the
+  old instruction.
 - **Length:** 7,500 iterations, batch 4, seed 42 (seed 43 for replication).
 - **Primary metric: held-out PSNR at iteration 7,500.** Train PSNR is
   secondary and is reported alongside, never in place of it — the two move
@@ -61,6 +69,31 @@ caching, checkpoint hygiene, export vectorization) are exempt from the full
 quality A/B and verified by loss-curve overlay against the control instead —
 but they still get a full-length run, because the wall-time claim is the
 point of them.
+
+## Stage 0 — the mechanism check
+
+Before any training run, prove that the change does the thing it is named
+after, as a direct assertion on the mechanism rather than on an outcome:
+
+- freezing something → assert the frozen values are bit-identical across an
+  optimizer step, *with warmed-up optimizer state*;
+- pruning/masking by index → assert the selected rows are the intended ones
+  after a densification and a prune, not merely that the mask length matches;
+- a rate or schedule change → assert the effective value at a few iterations;
+- a caching or hoisting change → assert numerical equivalence against the
+  unhoisted path on one batch.
+
+Two properties matter. It must exercise the **stateful** path — zeroing a
+gradient looks like a perfect freeze on a fresh optimizer and does nothing once
+Adam carries momentum, which is precisely how the static freeze passed every
+inspection for a week. And it must survive the **identity-changing** operations
+in the loop: densification appends rows, pruning compacts them, so any
+index-based structure has to be re-derived or invalidated at those points.
+
+Keep the check as a regression test, not a scratch script. This stage costs
+minutes and, in the one case where it was skipped, would have saved three
+7,500-iteration runs, a two-seed replication, a production-config change, and
+a round of downstream sessions briefed on void control numbers.
 
 ## Stage 1 — the smoke gate
 
@@ -112,23 +145,43 @@ Rules:
   indicative only. Quality metrics are unaffected. Mark contended rows.
 - `train.py` refuses to start if the output folder already exists. Use a fresh
   `output_dir` per run; never overwrite a run you may want to re-read.
+- **Re-run the control from the same base revision as the arm.** Historical
+  control numbers cannot be carried across a base-code change. Reusing them is
+  how void numbers propagated into downstream sessions during this campaign.
 
-**Full-run held-out variance is ~±0.4 dB**, established the hard way: three
-runs of the same production profile landed at 20.61 / 20.48 / 20.39, and one
-change that measured +0.5 dB once measured -1.0 dB on the next seed. An
-initial estimate of ±0.3 dB was revised upward after the seed-43 pass.
+**Same-config seed variance is small: 0.09 dB** — three seeds of the production
+profile at 20.48 / 20.39 / 20.44. A ±0.4 dB working band was used for most of
+the campaign and appears throughout the older experiment logs; it was assembled
+from runs that were not in fact the same configuration, and was then defended
+rather than questioned when one arm started swinging by 1 dB. Treat 0.1-0.2 dB
+as the honest same-config band and be correspondingly suspicious of a wide one.
+
+**Variance asymmetry between arms is a bug signal.** If the treatment arm is
+much noisier than the control, audit the treatment code before averaging more
+seeds. A change that merely helps or does not help has no mechanism by which to
+multiply run-to-run variance tenfold; one that is randomly perturbing state
+does. Widening the error bars is the wrong instinct and cost this campaign a
+full extra seed plus a retracted adoption.
 
 ## Replication before adoption
 
 - **Delta > 1 dB on the primary metric:** one seed may be enough to adopt,
   with a replication run queued behind it.
-- **Delta < 1 dB:** requires a **second seed** before adoption. This is not
-  optional. sqrt-batch LR scaling measured 20.91 / 20.19 / 19.42 across three
-  runs — a 1.5 dB spread straddling baseline — and was rejected after the
-  seed-43 pass showed the initial +0.5 dB was sampling luck.
-- **Delta within ±0.4 dB on a change that is supposed to be quality-inert**
-  (caching, sync removal): that is a pass, and the wall-time win is the
-  result.
+- **Delta < 1 dB:** requires **three paired seeds** before adoption — the arm
+  and its control at each seed, all from the same base revision. Two is not
+  enough: it is enough to reject sampling luck (sqrt-batch LR measured 20.91 /
+  20.19 / 19.42 and was correctly rejected on the seed-43 pass) but not enough
+  to size the variance you are testing against, and the third seed is what
+  exposed the static freeze.
+- **Pre-register the interpretation** when a replication run is launched to
+  settle a disputed result: write down, before it lands, which outcome means
+  adopt and which means revert. This was done for the seed-44 control and is
+  the reason that result was acted on rather than argued with.
+- **A change that is supposed to be quality-inert** (caching, sync removal):
+  parity within the same-config band is a pass, and the wall-time win is the
+  result. Prefer proving inertness directly — a loss-curve overlay, or a
+  numerical-equivalence assertion at Stage 0 — over inferring it from a
+  final-metric delta.
 
 Record the rejected runs. Half the value of the experiment log is the list of
 plausible ideas that did not survive.
@@ -254,18 +307,22 @@ PR, is the durable record of why a change was or was not adopted.
 
 Before launching:
 
-- [ ] `--res 2` passed explicitly.
+- [ ] A mechanism check asserts the change does what it is named after, with
+      warmed-up optimizer state and across a densify/prune cycle.
+- [ ] Resolution is res 2 — from the config, or from an explicit `--res 2`.
 - [ ] Split is the 8-camera split unless the experiment is about the split.
 - [ ] Exactly one variable differs from the named baseline.
-- [ ] Control is running concurrently, from the base worktree, same seed.
+- [ ] Control is running concurrently, from the base worktree at the **same
+      base revision**, same seed.
 - [ ] `output_dir` is fresh and named after the experiment.
 - [ ] Contention on either GPU is noted.
 
 Before adopting:
 
 - [ ] Held-out PSNR is the number being claimed.
-- [ ] Delta exceeds ±0.4 dB, or the change is a speed-only change at parity.
-- [ ] Sub-1 dB delta replicated on a second seed.
+- [ ] The treatment arm's seed spread is comparable to the control's; if it is
+      much wider, audit the code instead of adopting.
+- [ ] Sub-1 dB delta replicated across three paired seeds.
 - [ ] Result and verdict commented on the issue thread, including the
       mechanism if it regressed.
 - [ ] Run added to the `RUNS` manifest in `build_experiment_report.py`.

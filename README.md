@@ -197,15 +197,22 @@ export FOURC4D_OUTPUT=/path/to/output-root        # -> ModelParams.model_path
 
 python train.py \
   --config configs/custom/xuelong_posefix_production.yaml \
-  --res 2 \
-  --output_dir production \
-  --training_view 0,1,2,3,5,7,8,9
+  --output_dir production
 ```
 
-The run lands in `$FOURC4D_OUTPUT/production`.
+The run lands in `$FOURC4D_OUTPUT/production`. The profile is self-contained —
+resolution, split, budget and batch size all come from the config, so no extra
+flags are needed to reproduce the validated run.
 
-**Always pass `--res` explicitly.** It defaults to 1 and is applied *after* the
-YAML merge, so omitting it silently trains at full resolution.
+An explicitly typed command-line flag outranks the config; a flag left at its
+default does not. That precedence matters here because several flags are
+aliases for config keys with non-`None` defaults (`--res` is 1,
+`--initial_num_pts` is -1, `--weight_decay` is 1e-4). They used to be applied
+unconditionally *after* the merge, silently discarding the config's
+`resolution`, `num_pts` and `coefficient_weight_decay` — which is how two early
+ablations were invalidated by training at full resolution. Older experiment
+docs therefore instruct you to always pass `--res` explicitly; that is no
+longer required, but it remains harmless.
 
 Because top-level YAML keys override `train.py` arguments, each tuned behaviour
 below is config-settable as well as available on the CLI:
@@ -213,7 +220,7 @@ below is config-settable as well as available on the CLI:
 | Config key / flag | Production value | Effect |
 | --- | --- | --- |
 | `gpu_cache` / `--gpu_cache` | `true` | decode the whole training set once and keep it as uint8 on the GPU; drops the DataLoader, per-iteration H2D copies and camera deepcopies. Quality-inert, ~17% less wall time. |
-| `freeze_static_temporal` / `--freeze_static_temporal` | `true` | zero the temporal gradients (`t`, `scaling_t`, `rotation_r`) of gaussians whose support spans the whole clip, so background geometry stops churning in time. +0.6-0.7 dB held-out on two seeds. |
+| `freeze_static_temporal` / `--freeze_static_temporal` | `false` | hold the temporal parameters (`t`, `scaling_t`, `rotation_r`) of gaussians whose support spans the whole clip, so background geometry stops churning in time. Briefly adopted on a two-seed win, then withdrawn: those runs predate the implementation fix and are void. Correct now, but not yet validly measured. |
 | `densify_until_num_points` / `--max_num_pts` | `1000000` | hard gaussian budget. Halves model size and wall time; above ~1M this scene only gains train-view fidelity. |
 | `exhaust_test` | `true` | evaluate held-out views on a regular schedule including the final iteration. |
 | `color_affine` / `--color_affine` | off | per-camera 3x4 color affine on the training loss. No gain on this rig (view-dependent SH already absorbed the mismatch); keep for rigs with worse color consistency. |
@@ -221,6 +228,9 @@ below is config-settable as well as available on the CLI:
 Both boolean flags accept a negation on the CLI (`--no-gpu_cache`,
 `--no-freeze_static_temporal`) to override the config for an experiment.
 Deliberately *not* enabled: sqrt-batch LR scaling, rejected across three seeds.
+
+The config also pins `training_view` and `resolution`, so the validated split
+and resolution are reproduced without extra flags.
 
 #### Running experiments on the trainer
 

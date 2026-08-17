@@ -7,7 +7,15 @@ that taught it. The protocol these lessons produced is
 
 All figures are held-out PSNR at iteration 7,500 on the 8-camera split (train
 `0,1,2,3,5,7,8,9`, held out `4,6`), `--res 2`, batch 4, seed 42 unless a seed
-is named. Full-run held-out variance on this benchmark is **±0.4 dB**.
+is named.
+
+**On the noise band.** The campaign ran for most of its life on a working
+estimate of ±0.4 dB. Three seeds of the production configuration later came in
+at 20.48 / 20.39 / 20.44 — a spread of **0.09 dB**. The same-config seed noise
+on this benchmark is small; the ±0.4 band was assembled from runs that were not
+actually the same configuration, and was then widened further by an arm that
+turned out to be buggy (§7). Read the older ±0.4 figures below as the band the
+decisions were made under, not as the benchmark's real variance.
 
 ---
 
@@ -95,6 +103,16 @@ mismatch.
 
 **Generalization: "the parameter learned something meaningful" is not
 evidence of improvement.** Only the held-out metric is.
+
+Caveat, recorded because §7 makes it necessary: review later found two defects
+in this implementation — the affine index was built from `args.training_view`
+rather than from the cameras actually in the dataset, and the affines were not
+restored on `--start_checkpoint` resume. Neither affects this verdict. All the
+custom configs run with `eval: true`, where the COLMAP loader does honour the
+training-view list, and the 4.8 dB raw-render shift is direct evidence the
+affines were active and learning. The indexing defect would silently disable
+compensation under `eval: false` or the Blender loader, so a rig that re-tests
+this flag should confirm the same shift before believing a null result.
 
 ---
 
@@ -187,20 +205,21 @@ evidence available, not a universal constant.
 | [#7](https://github.com/xuelongmu/4C4D/issues/7) once-per-step batch-compensated opacity decay | **+0.6 dB** | train +1.2 dB, faster | adopted |
 | [#18](https://github.com/xuelongmu/4C4D/issues/18) 1M gaussian budget | **+0.2 dB** | half the model, -18% wall | adopted |
 | [#15](https://github.com/xuelongmu/4C4D/issues/15) GPU-resident uint8 image cache | parity (quality-inert) | **-17% wall** (understated: contended GPU) | adopted |
-| [#20](https://github.com/xuelongmu/4C4D/issues/20) static-temporal freeze | **+0.6 / +0.7 dB** (seeds 42 / 43) | train +1 dB, wall unchanged | adopted |
+
+(The static-temporal freeze was briefly a fourth entry here. It is not one —
+see §7.)
 
 Net for the campaign: **~47 min → 18:29** for 7,500 iterations at held-out
-parity or better, with half the model size — and then +0.6-0.7 dB on top from
-the static freeze.
+parity or better, with half the model size.
 
-Three things the winners share:
+Two things the winners share:
 
-- **They constrain rather than add.** Decaying opacity once per step instead
-  of four times, capping the population, freezing temporal parameters of
-  gaussians that do not move in time. The losers all *added* degrees of
-  freedom (temporal densification capacity, doubled LRs, per-camera affines).
-  Under 8 cameras, the scarce resource is evidence, and constraints act as
-  regularizers.
+- **They constrain rather than add.** Decaying opacity once per step instead of
+  four times; capping the population. The losers all *added* degrees of freedom
+  (temporal densification capacity, doubled LRs, per-camera affines). Under 8
+  cameras the scarce resource is evidence, and constraints act as regularizers.
+  This is a hypothesis-generator, not a law — it is also exactly the prior that
+  made the static freeze so easy to believe.
 - **The #7 subtlety is worth stating twice.** Hoisting the decay out of the
   batch loop is a pure correctness fix, but the naive hoist weakens the
   effective decay from `factor^batch_size` to `factor^1` — the first attempt
@@ -208,21 +227,74 @@ Three things the winners share:
   adopted version compounds the factor by `batch_size` so the shipped batch-4
   behaviour is preserved. A correctness fix that silently changes a
   hyperparameter is two changes.
-- **The static freeze punches above its footprint.** Only ~2.5% of gaussians
-  end up frozen, yet it is the largest quality win in the campaign. The gain
-  is very unlikely to come from those 2.5% directly; it most plausibly comes
-  from stabilizing background geometry early so the rest of the optimization
-  is not chasing a moving reference. That reading is what makes the full
-  static/dynamic split (#20: 3D-SH background subset, background pretraining)
-  worth the larger implementation cost.
+---
+
+## 7. Two seeds replicated a feature that was never running
+
+The static-temporal freeze
+([#20](https://github.com/xuelongmu/4C4D/issues/20)) measured +0.73 dB on seed
+42 and +0.56 dB on seed 43 — paired against per-seed controls, beyond the
+working noise band, adopted into the production config, and written up as the
+campaign's first enhancement-track quality win. It was none of those things.
+
+| Seed | control (no freeze) | freeze arm | delta |
+| ---: | ---: | ---: | ---: |
+| 42 | 20.48 | 21.21 | +0.73 |
+| 43 | 20.39 | 20.95 | +0.56 |
+| 44 | 20.44 | 20.15 | **-0.29** |
+| spread | **0.09** | **1.06** | |
+
+Code review on PR #40 found two defects that make all three runs
+uninterpretable:
+
+1. **Zeroing a gradient does not freeze a parameter under Adam.** Momentum
+   accumulated before a gaussian became static keeps stepping the masked rows
+   until it decays. Measured in isolation: after 30 steps the "frozen" rows had
+   drifted 0.150 while free rows moved 0.163 — the freeze was ~8% effective.
+2. **Stale masks.** The mask was reused whenever its length matched the
+   parameter length, but densification appends rows and pruning compacts them,
+   so equal length does not mean equal identity. The mask could pin arbitrary
+   unrelated gaussians — a seed-dependent random perturbation, and the likely
+   source of the 1.06 dB spread.
+
+So the correct status of #20-lite is **never validly measured**, not *won then
+failed to replicate*. Three lessons, and they are the most transferable in this
+document:
+
+- **Variance asymmetry between arms is a bug signal, not a noise
+  observation.** The control configuration is stable to 0.09 dB across three
+  seeds while the treatment arm swings 1.06 dB. A feature that merely helps or
+  does not help should not multiply run-to-run variance tenfold. The instinct
+  on seeing that was to widen the error bars and average more seeds; the
+  correct response was to audit the treatment code.
+- **Verify that a mechanism does what its name claims before measuring its
+  effect.** A single assertion that the frozen rows do not change between
+  steps would have caught this before any full run — cheaper than three
+  7,500-iteration runs and the two-seed replication that "confirmed" them. The
+  smoke gate proved the code ran; nothing proved the freeze froze. This is now
+  a required stage in `EXPERIMENT_METHODOLOGY.md`, and the invariant has a
+  regression test.
+- **Replication is necessary, not sufficient.** The two-seed rule (§1c) is a
+  defence against sampling luck, and it worked as designed against sqrt-batch
+  LR. It offers no protection at all against a treatment arm that is measuring
+  something other than the treatment — two seeds of a broken feature replicate
+  the brokenness.
+
+A related process failure fell out of the same episode: **a control must be run
+from the same base revision as its arm.** Historical control numbers were
+reused across a base-code change, and downstream sessions were briefed with the
+old freeze numbers as their controls before the correction landed.
 
 ---
 
-## 7. Process notes that paid for themselves
+## 8. Process notes that paid for themselves
 
-- **Absolute-path config and explicit `--res`.** Two full ablations were
-  discarded because `--res` defaults to 1 and is applied after the YAML merge.
-  Cost: several GPU-hours and one round of wrong conclusions.
+- **Flag defaults that outrank the config are a silent-invalidation machine.**
+  Two full ablations were discarded because `--res` defaults to 1 and was
+  applied after the YAML merge; `--initial_num_pts` and `--weight_decay` had
+  the same shape. The campaign ran for weeks on the workaround ("always pass
+  `--res 2`") before the precedence itself was fixed. A standing workaround in
+  a protocol doc is a bug report that nobody filed.
 - **Preserve every log.** `<run_dir>/train.log` plus `training_params.txt` is
   what made bisecting possible weeks later, and what
   `scripts/build_experiment_report.py` reads. Shell history is not a record.
@@ -243,9 +315,14 @@ Three things the winners share:
   held-out gate, since the raw form cost 1.4 dB.
 - [#10](https://github.com/xuelongmu/4C4D/issues/10) temporal prune redesign —
   margin beyond the render gate, opacity precondition, or final-pass only.
-- [#20](https://github.com/xuelongmu/4C4D/issues/20) full static/dynamic split
-  with a 3D-SH background subset — the freeze result raises confidence in its
-  ceiling.
+- [#20](https://github.com/xuelongmu/4C4D/issues/20) static-temporal freeze —
+  the implementation is now correct and covered by a regression test, and has
+  never been validly measured. It needs a paired A/B on the fixed code across
+  three seeds before the production default goes back to `true`. The full split
+  (3D-SH background subset, background pretraining) is a separate, larger item.
+  Note the known limitation recorded at the call site: `get_cov_t` builds the
+  temporal marginal from the full space-time covariance, so `_rotation` and
+  `_scaling` also influence temporal support and are deliberately not frozen.
 - [#19](https://github.com/xuelongmu/4C4D/issues/19) MASt3R / video-depth
   supervision — the largest untested lever against the held-out gap, and the
   literature's +1-2 dB class in sparse regimes.
