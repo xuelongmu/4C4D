@@ -42,8 +42,21 @@ RUNS = [
     ("ab8-qualityprofile", "Candidate: sqrtLR+cache",             "5. Profiles",     "did not replicate sqrt gain", ""),
     ("ab8-fast-s43",       "Production profile, seed 43",         "6. Replication",  "confirms stability (20.39)", ""),
     ("ab8-sqrtlr-s43",     "sqrtLR+cache, seed 43",               "6. Replication",  "19.42 — confirms sqrt-LR rejection", ""),
-    ("ab8-staticfreeze",   "Static-temporal freeze",              "7. Static split", "WIN: +0.73 held-out vs control — adopted", "20"),
-    ("ab8-staticfreeze-s43", "Static-temporal freeze, seed 43",   "7. Static split", "WIN replicated: +0.56 held-out", "20"),
+    # Runs 17-19 are INVALID: they used the pre-d8a7d29 freeze, in which zeroed
+    # gradients did not hold parameters under Adam (~8% effective) and stale
+    # masks could pin unrelated gaussians after densification. Kept visible
+    # rather than deleted — the wrong conclusion is part of the record.
+    ("ab8-staticfreeze",   "Static freeze (broken impl)",         "7. Static split — INVALID", "INVALID: measured a ~8%-effective freeze + random pinning", "20"),
+    ("ab8-staticfreeze-s43", "Static freeze, seed 43 (broken)",   "7. Static split — INVALID", "INVALID: same broken implementation", "20"),
+    ("ab8-staticfreeze-s44", "Static freeze, seed 44 (broken)",   "7. Static split — INVALID", "INVALID: 20.15, below control — exposed the bug", "20"),
+    ("ab8-nofreeze-s44",   "No-freeze control, seed 44",          "7. Static split — INVALID", "valid control (20.44); broke the two-seed story", ""),
+    # Clean re-measurement: both arms from the same base revision, three seeds.
+    ("fx-ctl-s42",         "Fixed A/B: control, seed 42",         "8. Clean re-measure", "paired control", "20"),
+    ("fx-ctl-s43",         "Fixed A/B: control, seed 43",         "8. Clean re-measure", "paired control", "20"),
+    ("fx-ctl-s44",         "Fixed A/B: control, seed 44",         "8. Clean re-measure", "paired control", "20"),
+    ("fx-frz-s42",         "Fixed A/B: freeze, seed 42",          "8. Clean re-measure", "fixed freeze implementation", "20"),
+    ("fx-frz-s43",         "Fixed A/B: freeze, seed 43",          "8. Clean re-measure", "fixed freeze implementation", "20"),
+    ("fx-frz-s44",         "Fixed A/B: freeze, seed 44",          "8. Clean re-measure", "fixed freeze implementation", "20"),
 ]
 
 PROBE = "cam06_0036"
@@ -121,7 +134,8 @@ def svg_chart(series, width=960, height=360, y_min=17.0, y_max=21.5):
 
 PALETTE = ["#e05252", "#e0a052", "#d6d652", "#7ac74f", "#4fc7a0", "#4fa9c7", "#527ae0",
            "#8f52e0", "#c752c7", "#c75283", "#9aa5b1", "#6b7683", "#f0f0f0", "#a0e052",
-           "#52e0c7", "#e052a0"]
+           "#52e0c7", "#e052a0", "#ff8a5c", "#b5e853", "#5cc9ff", "#ff5c9d", "#c0a76b",
+           "#7fd1b9", "#d17f7f", "#9d7fd1", "#7f9dd1", "#d1b97f"]
 
 
 def main():
@@ -157,8 +171,9 @@ def main():
         img_html = (f'<img src="{img_uri}" data-render="{img_uri}" loading="lazy" '
                     f'title="hold to compare with ground truth">' if img_uri
                     else "<div class='noimg'>no render</div>")
+        invalid = "INVALID" in verdict or "INVALID" in phase
         cards.append(f"""
-<div class="card">
+<div class="card{' invalid' if invalid else ''}">
   <div class="cardhead"><span class="dot" style="background:{PALETTE[i % len(PALETTE)]}"></span>
     <b>{html.escape(title)}</b><span class="phase">{html.escape(phase)}{issue_html}</span></div>
   {img_html}
@@ -197,6 +212,10 @@ h1 {{ font-size:20px; }} h2 {{ font-size:16px; margin-top:32px; }}
 a {{ color:#6fb3ff; }}
 .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:16px; }}
 .card {{ background:#161a20; border-radius:10px; padding:12px; }}
+.card.invalid {{ background:#1a1416; border:1px solid #5a2a2a; }}
+.card.invalid img {{ filter:grayscale(0.7) brightness(0.65); }}
+.card.invalid .verdict {{ color:#e08a8a; font-weight:600; }}
+.card.invalid b {{ text-decoration:line-through; text-decoration-color:#8a5252; }}
 .card img {{ width:100%; border-radius:6px; cursor:pointer; display:block; }}
 .cardhead {{ display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }}
 .phase {{ color:#8a94a2; font-size:12px; }}
