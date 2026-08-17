@@ -94,7 +94,18 @@ class GaussianModel:
         # Boolean [N] mask of gaussians whose temporal support spans the whole
         # clip; maintained by train.py when --freeze_static_temporal is on.
         self.static_mask = None
-        
+        # Persistent background label (--bg_static_split). Unlike static_mask,
+        # which is re-derived from the temporal marginal every 100 iterations,
+        # this survives densification: it is assigned once by the background
+        # pretrain and then carried through prune/clone/split. Children of
+        # background gaussians are born dynamic, so the performer grows as a
+        # residual layer on top of a fixed background scaffold.
+        self._is_static = None
+        # True clip bounds in gaussian-time units, measured from the camera
+        # timestamps rather than assumed from `time_duration` (see
+        # set_clip_bounds). None until train.py sets it.
+        self.clip_bounds = None
+
         self.coefficient = coefficient
         self.setup_functions()
 
@@ -258,7 +269,155 @@ class GaussianModel:
         # it in rather than rebuilding the 4D covariance chain per viewpoint.
         sigma = self.get_cov_t(scaling_modifier) if cov_t is None else cov_t
         return torch.exp(-0.5*(self.get_t-timestamp)**2/sigma) # / torch.sqrt(2*torch.pi*sigma)
-    
+
+    # ---- static/dynamic split (--bg_static_split) --------------------------
+    #
+    # The renderer drops a gaussian at a timestamp once its temporal marginal
+    # falls below RENDER_GATE, so a gaussian with temporal variance cov_t
+    # contributes over the window t +/- half_width(cov_t).
+
+    RENDER_GATE = 0.05
+
+    def get_clip_bounds(self):
+        """True clip bounds, falling back to the configured time_duration."""
+        return self.clip_bounds if self.clip_bounds is not None else tuple(self.time_duration)
+
+    def set_clip_bounds(self, t_min, t_max):
+        self.clip_bounds = (float(t_min), float(t_max))
+
+    def whole_clip_scaling_t(self, margin=1.1):
+        """_scaling_t value whose support covers the whole clip, with margin.
+
+        Solves half_width(cov_t) = margin * duration/2 for cov_t, then inverts
+        the exp activation. With rot_4d and an identity rotation_r,
+        cov_t == get_scaling_t ** 2.
+        """
+        t0, t1 = self.get_clip_bounds()
+        half = margin * (t1 - t0) / 2.0
+        cov_t = half ** 2 / (-2.0 * math.log(self.RENDER_GATE))
+        scaling_t = math.sqrt(cov_t) if self.rot_4d else cov_t
+        return math.log(scaling_t)
+
+    def dynamic_scaling_t_init(self):
+        """_scaling_t for a freshly created dynamic gaussian.
+
+        Mirrors create_from_pcd's `dist_t = duration / 5` convention, but on the
+        measured clip bounds rather than the configured time_duration.
+        """
+        t0, t1 = self.get_clip_bounds()
+        dist_t = (t1 - t0) / 5.0
+        return math.log(math.sqrt(dist_t))
+
+    def make_whole_clip_static(self, margin=1.1):
+        """Park every gaussian at the clip midpoint with whole-clip support.
+
+        Used to enter the background pretrain: with the temporal marginal ~1 at
+        every timestamp, the model is effectively a pure 3D fit. Also resets the
+        Adam moments for the temporal parameters, whose old values refer to
+        pre-reset magnitudes.
+        """
+        t0, t1 = self.get_clip_bounds()
+        with torch.no_grad():
+            self._t.data.fill_((t0 + t1) / 2.0)
+            self._scaling_t.data.fill_(self.whole_clip_scaling_t(margin))
+            if self.rot_4d:
+                self._rotation_r.data.zero_()
+                self._rotation_r.data[:, 0] = 1.0
+        self._reset_temporal_optimizer_state()
+
+    def reinit_temporal_from_clip(self):
+        """Re-draw every gaussian's temporal parameters from the measured clip.
+
+        create_from_pcd draws t over the configured `time_duration` and sets
+        scaling_t from its length. When time_duration does not match the camera
+        timestamps, the gaussians are initialised for a clip the data does not
+        have. Re-drawing from the measured bounds restores the intended
+        initialisation (t spread over the clip, temporal extent = duration / 5).
+        """
+        t0, t1 = self.get_clip_bounds()
+        with torch.no_grad():
+            self._t.data.uniform_(t0, t1)
+            self._scaling_t.data.fill_(self.dynamic_scaling_t_init())
+            if self.rot_4d:
+                self._rotation_r.data.zero_()
+                self._rotation_r.data[:, 0] = 1.0
+        self._reset_temporal_optimizer_state()
+
+    def label_background(self, frac, margin=1.1, dynamic_bounds=None):
+        """Partition the gaussians into a background layer and a dynamic layer.
+
+        Background gaussians are parked at the clip midpoint with whole-clip
+        temporal support, so they render at every timestamp and (with their
+        temporal gradients frozen) stay temporally constant. Because the
+        training loss is L1, a temporally constant gaussian is pulled toward the
+        per-pixel temporal median of the frames it covers -- the same target the
+        median pretrain fits, but supervised by every frame instead of one
+        median image per camera.
+
+        The remaining gaussians get the ordinary dynamic initialisation and
+        carry all the motion. `dynamic_bounds` sets the range their `t` is drawn
+        from, separately from the measured clip the background spans: widening
+        the dynamic layer's temporal init to the true clip costs ~1 dB held-out
+        on this rig (see docs/experiments/2026-08-16-issue-20-static-dynamic-split.md),
+        so it defaults to the configured time_duration.
+        """
+        n = self._xyz.shape[0]
+        bg = torch.zeros(n, dtype=torch.bool, device="cuda")
+        bg[torch.randperm(n, device="cuda")[:int(n * frac)]] = True
+        t0, t1 = self.get_clip_bounds()
+        with torch.no_grad():
+            self._t.data[bg] = (t0 + t1) / 2.0
+            self._scaling_t.data[bg] = self.whole_clip_scaling_t(margin)
+            dyn = ~bg
+            n_dyn = int(dyn.sum())
+            if n_dyn:
+                # Spread the dynamic layer over its init range rather than
+                # stacking it at the midpoint: at init there is no residual to
+                # localise it.
+                d0, d1 = dynamic_bounds if dynamic_bounds is not None else tuple(self.time_duration)
+                self._t.data[dyn] = torch.empty((n_dyn, 1), device="cuda").uniform_(d0, d1)
+                self._scaling_t.data[dyn] = math.log(math.sqrt((d1 - d0) / 5.0))
+                if self.rot_4d:
+                    self._rotation_r.data[dyn] = 0.0
+                    self._rotation_r.data[dyn, 0] = 1.0
+            if self.rot_4d:
+                self._rotation_r.data[bg] = 0.0
+                self._rotation_r.data[bg, 0] = 1.0
+        self._is_static = bg
+        self._reset_temporal_optimizer_state()
+        return int(bg.sum()), n - int(bg.sum())
+
+    def _reset_temporal_optimizer_state(self):
+        """Drop Adam moments for the temporal parameters after a hard reset."""
+        if self.optimizer is None:
+            return
+        for group in self.optimizer.param_groups:
+            if group["name"] in ("t", "scaling_t", "rotation_r"):
+                state = self.optimizer.state.get(group["params"][0], None)
+                if state is not None:
+                    state["exp_avg"].zero_()
+                    state["exp_avg_sq"].zero_()
+
+    def new_dynamic_temporal(self, n, jitter=True):
+        """(t, scaling_t, rotation_r) for n gaussians born into the dynamic layer.
+
+        Born at the clip midpoint with the standard temporal extent so they can
+        migrate to whatever part of the clip the photometric residual wants,
+        with a small jitter so siblings do not stay degenerate.
+        """
+        t0, t1 = self.get_clip_bounds()
+        mid = (t0 + t1) / 2.0
+        t = torch.full((n, 1), mid, device="cuda")
+        if jitter:
+            t += torch.randn((n, 1), device="cuda") * ((t1 - t0) / 10.0)
+        scaling_t = torch.full((n, 1), self.dynamic_scaling_t_init(), device="cuda")
+        rotation_r = None
+        if self.rot_4d:
+            rotation_r = torch.zeros((n, 4), device="cuda")
+            rotation_r[:, 0] = 1.0
+        return t, scaling_t, rotation_r
+
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
@@ -583,7 +742,9 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        
+        if self._is_static is not None:
+            self._is_static = self._is_static[valid_points_mask]
+
         if self.gaussian_dim == 4:
             self._t = optimizable_tensors['t']
             self._scaling_t = optimizable_tensors['scaling_t']
@@ -670,7 +831,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_is_static=None):
         d = {"xyz": new_xyz,
             "f_dc": new_features_dc,
             "f_rest": new_features_rest,
@@ -698,6 +859,12 @@ class GaussianModel:
                 self._rotation_r = optimizable_tensors['rotation_r']
             self.t_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+        if self._is_static is not None:
+            if new_is_static is None:
+                # Nothing said otherwise: new gaussians join the dynamic layer.
+                new_is_static = torch.zeros(new_xyz.shape[0], dtype=torch.bool, device="cuda")
+            self._is_static = torch.cat((self._is_static, new_is_static), dim=0)
+
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -710,7 +877,14 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
-        
+
+        # Children inherit their parent's layer. `child_of_static` indexes the
+        # N tiled copies of the selected parents.
+        if self._is_static is not None:
+            child_of_static = self._is_static[selected_pts_mask].repeat(N)
+        else:
+            child_of_static = None
+
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
@@ -736,6 +910,11 @@ class GaussianModel:
             stds = self.get_scaling_xyzt[selected_pts_mask].repeat(N,1)
             means = torch.zeros((stds.size(0), 4),device="cuda")
             samples = torch.normal(mean=means, std=stds)
+            if child_of_static is not None:
+                # A background gaussian's temporal std spans the whole clip, and
+                # the 4D rotation mixes that axis into xyz. Drop the temporal
+                # component so the child gets a sane spatial offset.
+                samples[child_of_static, 3] = 0.0
             rots = build_rotation_4d(self._rotation[selected_pts_mask], self._rotation_r[selected_pts_mask]).repeat(N,1,1)
             new_xyzt = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyzt[selected_pts_mask].repeat(N, 1)
             new_xyz = new_xyzt[...,0:3]
@@ -743,7 +922,19 @@ class GaussianModel:
             new_scaling_t = self.scaling_inverse_activation(self.get_scaling_t[selected_pts_mask].repeat(N,1) / (0.8*N))
             new_rotation_r = self._rotation_r[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r)
+        if (child_of_static is not None and self.gaussian_dim == 4
+                and child_of_static.any()):
+            # Splitting divides scaling_t by 0.8N and jitters t, which is the
+            # mechanism that shrank temporal support geometrically and made the
+            # lite static set decay away. A background child must stay
+            # whole-clip, so it keeps its parent's temporal parameters
+            # untouched; only its spatial extent is refined.
+            parent_t = self._t[selected_pts_mask].repeat(N, 1)
+            parent_scaling_t = self._scaling_t[selected_pts_mask].repeat(N, 1)
+            new_t[child_of_static] = parent_t[child_of_static]
+            new_scaling_t[child_of_static] = parent_scaling_t[child_of_static]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, child_of_static)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -770,7 +961,13 @@ class GaussianModel:
             if self.rot_4d:
                 new_rotation_r = self._rotation_r[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r)
+        # Children inherit their parent's layer. A clone already copies the
+        # parent's temporal parameters verbatim, so a background clone stays
+        # whole-clip with no further work.
+        new_is_static = (self._is_static[selected_pts_mask]
+                         if self._is_static is not None else None)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_t, new_scaling_t, new_rotation_r, new_is_static)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_grad_t=None, prune_only=False):
         if not prune_only:

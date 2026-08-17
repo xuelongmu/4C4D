@@ -12,6 +12,7 @@
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
+import copy
 import random
 import torch
 from torch import nn
@@ -52,6 +53,92 @@ def color_affine_key(image_name):
     """
     head, sep, tail = image_name.rpartition('_')
     return head if sep and tail.isdigit() else image_name
+
+
+def temporal_median_targets(cameras, images):
+    """Per-camera pixelwise temporal median, and one camera parked at clip mid.
+
+    The median over a camera's frames is the classic static-background estimate:
+    anything the performer occludes for less than half the clip is voted out.
+    Returns [(median_image_float, camera)] with one entry per physical camera.
+    """
+    from collections import defaultdict
+
+    by_cam = defaultdict(list)
+    for idx, cam in enumerate(cameras):
+        by_cam[color_affine_key(cam.image_name)].append(idx)
+
+    targets = []
+    for cam_name in sorted(by_cam):
+        idxs = by_cam[cam_name]
+        # uint8 median: exact for our purposes and 4x cheaper than float32.
+        median = images[idxs].median(dim=0).values.to(torch.float32).div_(255.0)
+        cam = copy.copy(cameras[idxs[0]])
+        targets.append((median, cam))
+    return targets
+
+
+def background_pretrain(gaussians, targets, opt, pipe, background, args, iters, batch_size, tb_writer=None):
+    """Fit the gaussians to per-camera temporal medians as a pure 3D scene.
+
+    Every gaussian is first parked at the clip midpoint with whole-clip temporal
+    support, so its temporal marginal is ~1 at every timestamp and the fit is
+    effectively 3D. Temporal gradients are held at zero throughout. On exit the
+    surviving gaussians are labelled background; the dynamic layer is then grown
+    on top of them by ordinary densification during the main run.
+
+    Densification is deliberately off here: the background is fitted with the
+    initial point budget so the main run starts from the usual gaussian count
+    and the usual densification schedule applies to both layers.
+    """
+    t0, t1 = gaussians.get_clip_bounds()
+    mid = (t0 + t1) / 2.0
+    gaussians.make_whole_clip_static(margin=args.bg_clip_margin)
+    for _, cam in targets:
+        cam.timestamp = mid
+
+    temporal_params = [gaussians._t, gaussians._scaling_t]
+    if gaussians.rot_4d:
+        temporal_params.append(gaussians._rotation_r)
+
+    print(f"\nBackground pretrain: {iters} iters against {len(targets)} temporal-median "
+          f"images (clip [{t0:.3f}, {t1:.3f}], all gaussians parked at t={mid:.3f})")
+    pbar = tqdm(range(iters), desc="BG pretrain", ncols=110)
+    for it in range(1, iters + 1):
+        gaussians.update_learning_rate(it)
+        batch = random.choices(targets, k=batch_size)
+        for gt_image, viewpoint_cam in batch:
+            # Opacity decay is a dynamic-scene mechanism (it prunes gaussians
+            # that only matter at some timestamps); it has nothing to act on
+            # here, so the pretrain renders without it (decayed_opacity=None).
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background,
+                                args=args, iteration=0)
+            image = render_pkg["render"]
+            Ll1 = l1_loss(image, gt_image)
+            Lssim = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            loss = ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * Lssim) / batch_size
+            loss.backward()
+
+        with torch.no_grad():
+            for p in temporal_params:
+                if p.grad is not None:
+                    p.grad.zero_()
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+            if it % 10 == 0:
+                pbar.set_postfix({"L1": f"{Ll1.item():.5f}"})
+                pbar.update(10)
+            if tb_writer is not None and it % 100 == 0:
+                tb_writer.add_scalar('bg_pretrain/l1_loss', Ll1.item(), it)
+    pbar.close()
+
+    with torch.no_grad():
+        alpha = gaussians.get_opacity[:, 0]
+        qs = torch.quantile(alpha.float(),
+                            torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=alpha.device))
+        print("Background pretrain done; opacity deciles "
+              + " ".join(f"{v:.3f}" for v in qs.tolist())
+              + f"; below prune threshold: {(alpha < opt.thresh_opa_prune).float().mean():.3f}")
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
@@ -226,9 +313,61 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True,
                                      num_workers=12 if dataset.dataloader else 0, collate_fn=lambda x: x, drop_last=True)
     
+    # The camera timestamps define the clip, not the configured time_duration.
+    # readColmapSceneInfo normalises the frame index to [0, 10) regardless of how
+    # long the clip actually is, so a config that declares time_duration
+    # [0.0, 5.0] for a 150-frame clip is describing only its first half. Every
+    # "does this gaussian span the whole clip" test below uses the measured
+    # bounds; the mismatch itself is reported so it does not stay invisible.
+    if gaussians.gaussian_dim == 4:
+        cam_timestamps = [c.timestamp for c in training_dataset.viewpoint_stack]
+        gaussians.set_clip_bounds(min(cam_timestamps), max(cam_timestamps))
+        t0_meas, t1_meas = gaussians.get_clip_bounds()
+        if abs(t0_meas - time_duration[0]) > 1e-3 or abs(t1_meas - time_duration[1]) > 1e-3:
+            print(f"\n[WARNING] time_duration is {list(time_duration)} but the training camera "
+                  f"timestamps span [{t0_meas:.3f}, {t1_meas:.3f}]. Gaussian init, the "
+                  f"rasterizer's temporal SH period and the static/dynamic split all read "
+                  f"time_duration, so they are configured for a different clip than the data.")
+
+    # label_background() re-draws the temporal parameters itself, so the standalone
+    # re-init only runs when the split is off.
+    if (args.fix_clip_bounds and not args.bg_static_split
+            and gaussians.gaussian_dim == 4 and not checkpoint):
+        gaussians.reinit_temporal_from_clip()
+        print(f"Re-initialised gaussian temporal parameters over the measured clip "
+              f"{list(gaussians.get_clip_bounds())}")
+
+    if args.bg_static_split:
+        if gaussians.gaussian_dim != 4:
+            raise ValueError("--bg_static_split requires 4D gaussians (gaussian_dim: 4)")
+        if args.bg_pretrain_iters > 0:
+            if args.gpu_cache:
+                median_targets = temporal_median_targets(cache_cameras, gpu_images)
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                print(f"\nDecoding {len(training_dataset)} images for temporal medians...")
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    decoded = list(pool.map(lambda i: training_dataset[i], range(len(training_dataset))))
+                median_cameras = [cam.cuda() for _, cam in decoded]
+                median_images = torch.stack(
+                    [(img * 255.0).round().to(torch.uint8) for img, _ in decoded]).cuda()
+                del decoded
+                median_targets = temporal_median_targets(median_cameras, median_images)
+                del median_cameras, median_images
+                torch.cuda.empty_cache()
+            background_pretrain(gaussians, median_targets, opt, pipe, background, args,
+                                args.bg_pretrain_iters, batch_size, tb_writer)
+            del median_targets
+            torch.cuda.empty_cache()
+        n_bg, n_dyn = gaussians.label_background(
+            args.bg_static_frac, args.bg_clip_margin,
+            dynamic_bounds=gaussians.get_clip_bounds() if args.fix_clip_bounds else time_duration)
+        print(f"Static/dynamic split: {n_bg:,} background (whole-clip, temporally frozen) / "
+              f"{n_dyn:,} dynamic")
+
     img_dir = os.path.join(scene.model_path, "rendered_images")
     os.makedirs(img_dir, exist_ok=True)
-    
+
     iteration = first_iter
     while iteration < opt.iterations + 1:
         for batch_data in (gpu_cache_batches() if args.gpu_cache else training_dataloader):
@@ -442,21 +581,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # _scaling still influence it and are deliberately left
                 # trainable here. This pins the purely temporal parameters, not
                 # the whole temporal support.
+                #
+                # The label-driven set (--bg_static_split) is valid from
+                # iteration 1; the re-derived mask needs densification to have
+                # started before it means anything.
                 frozen_rows = None
                 if (args.freeze_static_temporal and gaussians.gaussian_dim == 4
-                        and iteration > opt.densify_from_iter):
-                    sm = gaussians.static_mask
-                    if (iteration % 100 == 0 or sm is None
-                            or sm.shape[0] != gaussians._t.shape[0]):
-                        t0, t1 = gaussians.time_duration
-                        cov_t = gaussians.get_cov_t()
-                        t = gaussians.get_t
-                        m0 = torch.exp(-0.5 * (t - t0) ** 2 / cov_t)[:, 0] > 0.05
-                        m1 = torch.exp(-0.5 * (t - t1) ** 2 / cov_t)[:, 0] > 0.05
-                        sm = gaussians.static_mask = m0 & m1
+                        and (gaussians._is_static is not None
+                             or iteration > opt.densify_from_iter)):
+                    if gaussians._is_static is not None:
+                        # --bg_static_split: the frozen set is the persistent
+                        # background label, not a mask re-derived from the
+                        # temporal marginal. Re-deriving it each time makes the
+                        # static set decay away under densification, which is
+                        # what limited the lite version to ~2.5% of gaussians.
+                        sm = gaussians.static_mask = gaussians._is_static
                         if iteration % 500 == 0:
-                            print(f"\n[ITER {iteration}] static fraction: "
-                                  f"{sm.float().mean().item():.3f}")
+                            print(f"\n[ITER {iteration}] background fraction: "
+                                  f"{sm.float().mean().item():.3f} "
+                                  f"({int(sm.sum()):,} bg / {int((~sm).sum()):,} dynamic)")
+                    else:
+                        sm = gaussians.static_mask
+                        if (iteration % 100 == 0 or sm is None
+                                or sm.shape[0] != gaussians._t.shape[0]):
+                            t0, t1 = gaussians.time_duration
+                            cov_t = gaussians.get_cov_t()
+                            t = gaussians.get_t
+                            m0 = torch.exp(-0.5 * (t - t0) ** 2 / cov_t)[:, 0] > 0.05
+                            m1 = torch.exp(-0.5 * (t - t1) ** 2 / cov_t)[:, 0] > 0.05
+                            sm = gaussians.static_mask = m0 & m1
+                            if iteration % 500 == 0:
+                                print(f"\n[ITER {iteration}] static fraction: "
+                                      f"{sm.float().mean().item():.3f}")
                     params_t = [gaussians._t, gaussians._scaling_t]
                     if gaussians.rot_4d:
                         params_t.append(gaussians._rotation_r)
@@ -671,6 +827,22 @@ if __name__ == "__main__":
                         help='decode all training images once and keep them as uint8 on the GPU')
     parser.add_argument('--freeze_static_temporal', action=BooleanOptionalAction, default=False,
                         help='zero temporal gradients of gaussians whose support spans the whole clip')
+    parser.add_argument('--fix_clip_bounds', action=BooleanOptionalAction, default=False,
+                        help='re-initialise gaussian t/scaling_t from the measured camera timestamp '
+                             'range instead of the configured time_duration. Correct, but measures '
+                             '-1.0/-1.5 dB held-out on the posefix 8-cam split: the narrower init '
+                             'the mismatch produces is acting as a regulariser')
+    parser.add_argument('--bg_static_split', action=BooleanOptionalAction, default=False,
+                        help='split the gaussians into a whole-clip background layer with frozen '
+                             'temporal parameters and a dynamic layer (implies '
+                             '--freeze_static_temporal)')
+    parser.add_argument('--bg_static_frac', type=float, default=0.5,
+                        help='fraction of gaussians assigned to the background layer')
+    parser.add_argument('--bg_pretrain_iters', type=int, default=0,
+                        help='optional iterations of background pretraining against per-camera '
+                             'temporal-median images before the split (0 disables the pretrain)')
+    parser.add_argument('--bg_clip_margin', type=float, default=1.1,
+                        help='how far past the clip ends the background temporal support reaches')
     parser.add_argument("--reset_opacity", action="store_true", default=False)
     parser.add_argument("--add_size_threshold", action="store_true", default=False)
     
@@ -709,6 +881,16 @@ if __name__ == "__main__":
         # OptimizationParams class default (30000) regardless of config.
         args.test_iterations = args.test_iterations + [i for i in range(0, args.iterations, args.test_per_iter)]
         
+    if args.bg_static_split:
+        # The split is only meaningful if the background layer is actually held
+        # fixed in time; freezing is what the label is for. The background's
+        # whole-clip support is always sized from the measured clip, but the
+        # dynamic layer's temporal init is left alone unless --fix_clip_bounds
+        # is asked for: widening it costs ~1 dB held-out on this rig.
+        args.freeze_static_temporal = True
+        if not 0.0 < args.bg_static_frac < 1.0:
+            parser.error("--bg_static_frac must be strictly between 0 and 1")
+
     if args.initial_num_pts is not None:
         args.num_pts = args.initial_num_pts
                 
