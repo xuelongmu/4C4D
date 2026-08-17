@@ -51,6 +51,9 @@ def main():
     ap.add_argument("--frame", default="0000", help="frame whose COLMAP observations are used")
     ap.add_argument("--colmap", default="rgb_init/refined",
                     help="reconstruction to score against, relative to --scene")
+    ap.add_argument("--min_track", type=int, default=3,
+                    help="ignore points seen in fewer views than this; 2-view tracks are "
+                         "20%% gross-error and drag every prior's score down (see below)")
     args = ap.parse_args()
 
     scene = os.path.expanduser(args.scene)
@@ -67,15 +70,26 @@ def main():
     import struct
     with open(os.path.join(model_dir, "points3D.bin"), "rb") as f:
         (num_points,) = struct.unpack("<Q", f.read(8))
-        ids = []
+        ids, track_lens = [], []
         for _ in range(num_points):
             pid = struct.unpack("<Q", f.read(8))[0]
             f.read(35)  # xyz (3 doubles) + rgb (3 bytes) + error (1 double)
             (track_len,) = struct.unpack("<Q", f.read(8))
             f.read(8 * track_len)
             ids.append(pid)
-    pt_xyz = {pid: xyz[i] for i, pid in enumerate(ids)}
-    print(f"{len(pt_xyz)} triangulated points in {args.colmap}")
+            track_lens.append(track_len)
+
+    # Two-view tracks are the minimum COLMAP will emit and are badly
+    # unreliable here: measured against the recorded sensor depth their
+    # gross-error rate is 20%, versus 3.0% at three views, 0.4% at four and
+    # 0.0% at five or more. Two independent priors (MASt3R and the Kinect)
+    # disagree with the *same* points, so it is the ground truth that is
+    # wrong. Leaving them in caps every prior's apparent quality at ~0.7
+    # correlation regardless of how good it is.
+    pt_xyz = {pid: xyz[i] for i, pid in enumerate(ids)
+              if track_lens[i] >= args.min_track}
+    print(f"{len(pt_xyz)} of {len(ids)} triangulated points in {args.colmap} "
+          f"have track length >= {args.min_track}")
 
     per_cam = defaultdict(lambda: ([], []))
     for img in extr.values():
@@ -83,8 +97,12 @@ def main():
         cam_id, frame = name.split("_")
         if frame != args.frame:
             continue
-        prior_path = os.path.join(prior_dir, f"{cam_id}.npz")
-        if not os.path.exists(prior_path):
+        # Same precedence as utils/depth_priors.py: per-frame beats per-camera.
+        for stem in (f"{cam_id}_{frame}", cam_id):
+            prior_path = os.path.join(prior_dir, f"{stem}.npz")
+            if os.path.exists(prior_path):
+                break
+        else:
             continue
 
         with np.load(prior_path) as z:
@@ -95,7 +113,7 @@ def main():
 
         R = img.qvec2rotmat()
         obs_ids = img.point3D_ids
-        keep = obs_ids > -1
+        keep = np.array([i in pt_xyz for i in obs_ids])
         if not keep.any():
             continue
         xy = img.xys[keep]
@@ -126,15 +144,18 @@ def main():
             continue
         per_cam[cam_id] = (depth[v[ok], u[ok]], z_cam[ok], reproj_med)
 
-    print(f"\n{'cam':8} {'n':>6} {'spearman':>10} {'pearson':>9} {'reproj_px':>10}")
-    sps, prs = [], []
+    print(f"\n{'cam':8} {'n':>6} {'spearman':>10} {'pearson':>9} {'med|err|m':>10} {'reproj_px':>10}")
+    sps, prs, errs = [], [], []
     for cam_id in sorted(per_cam):
         d_prior, d_true, reproj = per_cam[cam_id]
         sp, pr = spearman(d_prior, d_true), pearson(d_prior, d_true)
-        sps.append(sp); prs.append(pr)
-        print(f"{cam_id:8} {len(d_prior):6d} {sp:10.3f} {pr:9.3f} {reproj:10.2f}")
+        # Only meaningful for a metric prior (the Depthkit one); a MASt3R prior
+        # is in an arbitrary scale and this column is noise there.
+        err = float(np.median(np.abs(d_prior - d_true)))
+        sps.append(sp); prs.append(pr); errs.append(err)
+        print(f"{cam_id:8} {len(d_prior):6d} {sp:10.3f} {pr:9.3f} {err:10.3f} {reproj:10.2f}")
     if sps:
-        print(f"{'MEAN':8} {'':6} {np.mean(sps):10.3f} {np.mean(prs):9.3f}")
+        print(f"{'MEAN':8} {'':6} {np.mean(sps):10.3f} {np.mean(prs):9.3f} {np.mean(errs):10.3f}")
         print("\nreproj_px is the control: sub-pixel means the poses, intrinsics and "
               "depth convention used here are correct, so a near-zero correlation is a "
               "real property of the prior and not a bug in this script.")
